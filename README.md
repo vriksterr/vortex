@@ -8,6 +8,15 @@ Gallouët, and its transport library, **vmux**, is derived from
 original BSD-3-Clause licence (see `LICENSE` and `vmux/LICENSE`). The upstream
 project's stable branch and wiki are at the glorytun link above.
 
+## Documentation
+
+* [User guide](docs/user-guide.html) -- a complete walk-through, from
+  concepts and install to every command, multi-client servers and tuning
+  (open the file in a browser).
+* [Getting started](docs/getting-started.md), [CLI reference](docs/cli-reference.md),
+  [Multi-client servers](docs/multi-client.md), [Architecture](docs/architecture.md)
+  and [Development](docs/development.md).
+
 ## Features
 
 The key features of Vortex come directly from vmux (derived from
