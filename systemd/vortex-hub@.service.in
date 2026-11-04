@@ -1,0 +1,14 @@
+[Unit]
+Description=Vortex multi-client server on %I
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+EnvironmentFile=/etc/vortex/%i/env
+ExecStart=@bindir@/vortex bind dev ${DEV} hub peers /etc/vortex/%i/peers.conf from addr ${BIND} port ${BIND_PORT} $OPTIONS
+ExecStartPost=-/etc/vortex/%i/post.sh
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

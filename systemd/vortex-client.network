@@ -1,0 +1,10 @@
+[Match]
+Name=vxc-*
+
+[Network]
+Description=Vortex client device
+DHCP=ipv4
+
+[DHCP]
+CriticalConnection=yes
+RouteTable=200

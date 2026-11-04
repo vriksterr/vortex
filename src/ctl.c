@@ -1,0 +1,273 @@
+#include "common.h"
+#include "ctl.h"
+
+#include <dirent.h>
+#include <libgen.h>
+#include <sys/stat.h>
+
+char *
+ctl_rundir(char *dst, size_t size)
+{
+    if (dst && size)
+        dst[0] = 0;
+
+    const char *fmt[] = {
+        "/run/user/%u/" PACKAGE_NAME,
+        "/run/"         PACKAGE_NAME ".%u",
+        "/var/run/"     PACKAGE_NAME ".%u",
+        "/tmp/"         PACKAGE_NAME ".%u",
+    };
+    /* First pass: prefer whichever candidate already actually has a real
+     * control socket sitting in it, over "whichever one happens to be
+     * writable right now" -- /run/user/<uid> only exists while at least
+     * one login session for that user is active (systemd tears the whole
+     * directory down when the last one ends, unless `loginctl enable-
+     * linger` is set), so its existence can flip between yes and no from
+     * one moment to the next, completely independent of whether a
+     * vortex daemon is even running or which directory it actually
+     * picked when it started. Without this, a daemon that started (and
+     * picked its directory via the second pass below) while no session
+     * was active becomes permanently unreachable to any client run later
+     * while a session happens to be active, purely because an earlier,
+     * unrelated candidate now also passes the plain writability check --
+     * confirmed live in production: the daemon correctly landed in
+     * /run/vortex.0 (no session at boot), but `vortex path` run from
+     * an active SSH session kept reporting "no active tunnel" because it
+     * found /run/user/0 writable (a session was active by then) and
+     * stopped there without ever finding the daemon's real socket. */
+    for (unsigned i = 0; i < COUNT(fmt); i++) {
+        int ret = snprintf(dst, size, fmt[i], geteuid());
+
+        if ((ret <= 0) || (size_t)ret >= size)
+            continue;
+
+        DIR *dp = opendir(dst);
+
+        if (!dp)
+            continue;
+
+        int has_entry = 0;
+
+        for (struct dirent *d; (d = readdir(dp));) {
+            if (d->d_name[0] != '.') {
+                has_entry = 1;
+                break;
+            }
+        }
+        closedir(dp);
+
+        if (has_entry)
+            return dst;
+    }
+    /* Second pass: nothing exists anywhere yet -- the genuinely-fresh
+     * case, e.g. the very first `bind` on this box -- so fall back to the
+     * original rule, picking the first candidate whose parent directory
+     * this process can actually create a new socket in. */
+    for (unsigned i = 0; i < COUNT(fmt); i++) {
+        char path[128];
+        int ret = snprintf(dst, size, fmt[i], geteuid());
+
+        if ((ret <= 0) ||
+            ((size_t)ret >= size) ||
+            ((size_t)ret >= sizeof(path)))
+            continue;
+
+        memcpy(path, dst, (size_t)ret + 1);
+        char *p = dirname(path);
+
+        if (p && !access(p, W_OK))
+            return dst;
+    }
+    errno = EPERM;
+    return NULL;
+}
+
+int
+ctl_reply(int fd, struct ctl_msg *res, struct ctl_msg *req)
+{
+    if ((send(fd, req, sizeof(struct ctl_msg), 0) == -1) ||
+        (recv(fd, res, sizeof(struct ctl_msg), 0) == -1))
+        return -1;
+
+    if (res->type != req->type || !res->reply) {
+        errno = EBADMSG;
+        return -1;
+    }
+    if (res->ret) {
+        errno = res->ret;
+        return -1;
+    }
+    return 0;
+}
+
+static int
+ctl_setsun(union ctl_sun *dst, const char *dir, const char *file)
+{
+    struct sockaddr_un sun = {
+        .sun_family = AF_UNIX,
+    };
+    int ret = snprintf(sun.sun_path, sizeof(sun.sun_path), "%s/%s", dir, file);
+
+    if (ret <= 0 || (size_t)ret >= sizeof(sun.sun_path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    dst->sun = sun;
+    return 0;
+}
+
+static int
+ctl_bind(int fd, const char *dir, const char *file)
+{
+    char name[10] = {[0] = '.'};
+    union ctl_sun sock;
+
+    if (EMPTY(file)) {
+        unsigned long pid = (unsigned long)getpid();
+
+        for (size_t i = 1; i < sizeof(name) - 1; i++, pid >>= 4)
+            name[i] = "uncopyrightables"[pid & 15];
+
+        file = name;
+    }
+    if (ctl_setsun(&sock, dir, file))
+        return -1;
+
+    if (unlink(sock.sun.sun_path) && errno != ENOENT)
+        return -1;
+
+    return bind(fd, &sock.sa, sizeof(sock));
+}
+
+void
+ctl_delete(int fd)
+{
+    union ctl_sun sock;
+    socklen_t slen = sizeof(sock);
+
+    if (!getsockname(fd, &sock.sa, &slen) && sock.sa.sa_family == AF_UNIX)
+        unlink(sock.sun.sun_path);
+
+    close(fd);
+}
+
+int
+ctl_create(const char *file)
+{
+    char dir[64];
+
+    if (!ctl_rundir(dir, sizeof(dir)))
+        return -1;
+
+    if (mkdir(dir, 0700) == -1 && errno != EEXIST)
+        return -1;
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+    if (ctl_bind(fd, dir, file)) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
+int
+ctl_connect(const char *file)
+{
+    char dir[64];
+    DIR *dp = NULL;
+
+    if (!ctl_rundir(dir, sizeof(dir)))
+        return -1;
+
+    if (!file) {
+        if (dp = opendir(dir), !dp)
+            return CTL_ERROR_NONE;
+
+        struct dirent *d = NULL;
+
+        while (d = readdir(dp), d) {
+            if (d->d_name[0] == '.')
+                continue;
+
+            if (file) {
+                closedir(dp);
+                return CTL_ERROR_MANY;
+            }
+            file = &d->d_name[0];
+        }
+        if (!file) {
+            closedir(dp);
+            return CTL_ERROR_NONE;
+        }
+    }
+    union ctl_sun sock;
+    const int ret = ctl_setsun(&sock, dir, file);
+
+    if (dp) {
+        int err = errno;
+        closedir(dp);
+        errno = err;
+    }
+    if (ret)
+        return -1;
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+    if (ctl_bind(fd, dir, NULL) ||
+        connect(fd, &sock.sa, sizeof(sock))) {
+        int err = errno;
+        ctl_delete(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
+void
+ctl_foreach(void (*cb)(const char *))
+{
+    char dir[64];
+
+    if (!ctl_rundir(dir, sizeof(dir)))
+        return;
+
+    DIR *dp = opendir(dir);
+
+    if (!dp)
+        return;
+
+    struct dirent *d = NULL;
+
+    while (d = readdir(dp), d) {
+        if (d->d_name[0] == '.')
+            continue;
+
+        int fd = ctl_connect(d->d_name);
+
+        if (fd < 0)
+            continue;
+
+        cb(d->d_name);
+        close(fd);
+    }
+    closedir(dp);
+}
+
+void
+ctl_explain_connect(int ret)
+{
+    switch (ret) {
+        case 0: break;
+        case CTL_ERROR_MANY: vx_log("please select a tunnel\n"); break;
+        case CTL_ERROR_NONE: vx_log("no active tunnel\n");       break;
+        default:             vx_log("unknown error\n");          break;
+        case -1: switch (errno) {
+            case 0: break;
+            case ENOENT:     vx_log("tunnel not found\n");       break;
+            default:         perror("connect");                  break;
+        }
+    }
+}

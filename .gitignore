@@ -1,0 +1,11 @@
+# build output
+/vortex
+/vortex.exe
+/.sodium/
+/build/
+*.o
+
+# personal notes, session logs and local tooling (not part of the project)
+/Notes/
+/session-log.html
+/.claude/

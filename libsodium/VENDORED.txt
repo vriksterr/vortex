@@ -1,0 +1,20 @@
+This directory is an unmodified copy of libsodium, bundled so that Vortex
+builds without a separately installed libsodium.
+
+  Project   : libsodium (https://libsodium.org, https://github.com/jedisct1/libsodium)
+  Version   : 1.0.22
+  Source    : https://download.libsodium.org/libsodium/releases/libsodium-1.0.22-stable.tar.gz
+  SHA-256   : f3a57b872dfa2410ed3f8b290ff63cc08955ad7e391406e07c1fe239829a865a
+  Signature : minisign, public key
+              RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+              (verified with: minisign -Vm libsodium-1.0.22-stable.tar.gz -P <key>)
+  Licence   : ISC, see LICENSE in this directory.
+
+Nothing in this directory has been changed. Vortex's top-level `make` (or
+`./sodium.sh`) configures it out of tree into ../.sodium/ and links the
+resulting static library into the vortex executable; the source tree here is
+never written to by a normal build.
+
+To update: download a newer release, verify its minisign signature with the
+key above, replace the contents of this directory (keep this file), update the
+version and hash above, rebuild and run the tests.

@@ -1,0 +1,2 @@
+option('bundled_libsodium', type : 'feature', value : 'auto',
+       description : 'Build and statically link the libsodium shipped in ./libsodium. auto: only when no system libsodium is found; enabled: always; disabled: never (a system libsodium is then required)')

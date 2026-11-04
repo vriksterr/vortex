@@ -1,0 +1,699 @@
+#include "common.h"
+#include "ctl.h"
+#include "argz.h"
+#include "path_manager.h"
+
+#include <time.h>
+
+/* Background-color highlighting for the group header's probe-status word --
+ * requested directly, terminal-only (gated on isatty() below, same
+ * precedent as bench.c's own isatty(1) check) so anything parsing this
+ * output (a script, a log file, `grep`) never sees raw escape codes mixed
+ * into the text. Foreground picked per background for contrast, not just
+ * the bare color, since a black-on-yellow "degraded" is a lot easier to
+ * actually read than default-on-yellow. */
+#define VX_COLOR_RESET  "\033[0m"
+#define VX_COLOR_GREEN  "\033[30;42m"
+#define VX_COLOR_YELLOW "\033[30;43m"
+#define VX_COLOR_RED    "\033[97;41m"
+
+static const char *
+vx_path_status_text(struct ctl_msg *res)
+{
+    switch (res->path_availability) {
+        case VX_PATH_INTERFACE_DOWN:  return "interface-down";
+        case VX_PATH_WAITING_ADDRESS: return "waiting-address";
+        case VX_PATH_ADMIN_DOWN:      return "down";
+    }
+    switch (res->path.status) {
+        case VMUX_DELETING: return "deleting";
+        case VMUX_PROBING:  return "probing";
+        case VMUX_DEGRADED: return "degraded";
+        case VMUX_LOSSY:    return "lossy";
+        case VMUX_LATE:     return "late";
+        case VMUX_WAITING:  return "waiting";
+        case VMUX_READY:    return "ready";
+        case VMUX_RUNNING:  return "running";
+        default:           return "waiting";
+    }
+}
+
+/* Two rows belong under the same group header if they're sub-flows of the
+ * same physical link -- same interface (or both legacy/no interface) and
+ * same remote *address*, differing only in conf.sock. Deliberately not
+ * remote port: mirrors vmux_path_same_group() in vmux.c exactly (see its own
+ * comment there) -- comparing port too, as an earlier version of this
+ * function did, groups correctly from the active side (every one of its
+ * sub-flows shares the same fixed remote port) but silently splits the
+ * passive side's own view into one header per sub-flow, since each one it
+ * auto-discovers has a distinct remote port by definition. That mismatch
+ * would otherwise also fragment group_rtt's/probe-loss's
+ * display -- correct values, just repeated across several one-line
+ * "groups" instead of pooled into the one that vmux.c itself already
+ * computed them for. */
+static int
+vx_path_same_group(struct ctl_msg *a, struct ctl_msg *b)
+{
+    /* different clients of a multi-client tunnel are never one group */
+    if (strcmp(a->peer, b->peer))
+        return 0;
+
+    if (strcmp(a->ifname, b->ifname))
+        return 0;
+
+    char ra[INET6_ADDRSTRLEN], rb[INET6_ADDRSTRLEN];
+    vx_toaddr(ra, sizeof(ra), &a->path.conf.remote);
+    vx_toaddr(rb, sizeof(rb), &b->path.conf.remote);
+
+    return !strcmp(ra, rb);
+}
+
+static int
+vx_path_remote_equal(const union vmux_sockaddr *a, const union vmux_sockaddr *b)
+{
+    if (a->sa.sa_family != b->sa.sa_family)
+        return 0;
+    if (a->sa.sa_family == AF_INET)
+        return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr &&
+               a->sin.sin_port == b->sin.sin_port;
+    if (a->sa.sa_family == AF_INET6)
+        return !memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr,
+                       sizeof(a->sin6.sin6_addr)) &&
+               a->sin6.sin6_port == b->sin6.sin6_port;
+    return 0;
+}
+
+static uint64_t
+vx_path_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+struct vx_path_sample {
+    int valid;
+    char ifname[IFNAMSIZ];
+    union vmux_sockaddr remote;
+    uint16_t sock;
+    uint64_t tx_bytes, rx_bytes;
+    uint64_t time_ns;
+};
+
+/* Live per-sub-flow throughput isn't exposed by the daemon at all -- tx.rate
+ * is the AIMD-computed *allowed* rate, not what's actually moving, so an
+ * idle sub-flow can still show a healthy tx.rate long after it stopped
+ * carrying anything. This computes a real observed rate entirely client-
+ * side instead: diff this call's cumulative tx.bytes/rx.bytes against the
+ * previous call's, over the wall-clock time actually elapsed between them.
+ * Requires two samples, so it only produces a number in `watch` mode (a
+ * single one-shot query has nothing prior to diff against) -- *tx_bps/
+ * *rx_bps are left at -1 to mean "no data yet" in that case. */
+static void
+vx_path_track_rate(struct ctl_msg *res, double *tx_bps, double *rx_bps)
+{
+    static struct vx_path_sample samples[VMUX_PATH_MAX * 2];
+
+    *tx_bps = -1;
+    *rx_bps = -1;
+
+    const uint64_t now = vx_path_now_ns();
+    struct vx_path_sample *slot = NULL, *free_slot = NULL;
+
+    for (unsigned int i = 0; i < VMUX_PATH_MAX * 2; i++) {
+        struct vx_path_sample *s = &samples[i];
+
+        if (!s->valid) {
+            if (!free_slot)
+                free_slot = s;
+            continue;
+        }
+        if (!strcmp(s->ifname, res->ifname) &&
+            s->sock == res->path.conf.sock &&
+            vx_path_remote_equal(&s->remote, &res->path.conf.remote)) {
+            slot = s;
+            break;
+        }
+    }
+    if (!slot)
+        slot = free_slot;
+
+    if (slot && slot->valid) {
+        const uint64_t dt = now - slot->time_ns;
+
+        if (dt >= 100 * UINT64_C(1000000) &&
+            res->path.tx.bytes >= slot->tx_bytes &&
+            res->path.rx.bytes >= slot->rx_bytes) {
+            *tx_bps = (double)(res->path.tx.bytes - slot->tx_bytes) *
+                      8.0 * 1e9 / (double)dt;
+            *rx_bps = (double)(res->path.rx.bytes - slot->rx_bytes) *
+                      8.0 * 1e9 / (double)dt;
+        }
+    }
+    if (slot) {
+        slot->valid = 1;
+        memcpy(slot->ifname, res->ifname, sizeof(slot->ifname));
+        slot->sock = res->path.conf.sock;
+        slot->remote = res->path.conf.remote;
+        slot->tx_bytes = res->path.tx.bytes;
+        slot->rx_bytes = res->path.rx.bytes;
+        slot->time_ns = now;
+    }
+}
+
+/* Fixed Mbps (megabits/second) rather than vx_torate()'s dynamic bit/kbit/
+ * Mbit/Gbit scaling -- easier to scan a column of these at a glance without
+ * mentally converting between units row to row. */
+static void
+vx_path_format_mbps(char *buf, size_t size, double bps)
+{
+    if (bps < 0)
+        snprintf(buf, size, "-");
+    else
+        snprintf(buf, size, "%.2fmbps", bps / 1e6);
+}
+
+static void
+vx_path_print_row(struct ctl_msg *res, double tx_bps, double rx_bps, int last)
+{
+    char tx_str[32], rx_str[32];
+
+    vx_path_format_mbps(tx_str, sizeof(tx_str), tx_bps);
+    vx_path_format_mbps(rx_str, sizeof(rx_str), rx_bps);
+
+    printf("  %s %u  %-8s%s", last ? "\xe2\x94\x94\xe2\x94\x80" /* "└─" */
+                                  : "\xe2\x94\x9c\xe2\x94\x80" /* "├─" */,
+           res->path.conf.sock, vx_path_status_text(res),
+           res->path.conf.monitor ? "  monitor" : "");
+
+    char tmp[INET6_ADDRSTRLEN];
+
+    /* tx-loss/rx-loss/tx-loss-live/rx-loss-live used to print here --
+     * removed entirely, not just hidden: `monitor` is mandatory on every
+     * path now (see "Probe-based path health" in vmux.c), vmux.c has
+     * stopped computing these four fields at all, and the group header's
+     * probe-loss/probe-status below is the only real loss/health figure
+     * that exists anymore. */
+    printf("  tx %s  rx %s  rtt %.3f", tx_str, rx_str, res->path.rtt.val / 1e3);
+    printf("  mtu %zu", res->path.mtu);
+    if (vx_toaddr(tmp, sizeof(tmp), &res->path.remote))
+        printf("  public unknown\n");
+    else if (res->path.remote.sa.sa_family == AF_INET6)
+        /* Bracketed, same convention as a URL or curl's own output --
+         * an IPv6 address is itself colon-delimited, so a bare
+         * address:port would be ambiguous about where the address ends
+         * and the port begins. */
+        printf("  public [%s]:%"PRIu16"\n", tmp, vx_get_port(&res->path.remote));
+    else
+        printf("  public %s:%"PRIu16"\n", tmp, vx_get_port(&res->path.remote));
+}
+
+static void
+vx_path_conf(struct ctl_msg *res)
+{
+    const char *state = NULL;
+    char local[INET6_ADDRSTRLEN];
+    char remote[INET6_ADDRSTRLEN];
+    char beat[32];
+    char tx[32], rx[32];
+    char rttlimit[32];
+
+    switch (res->path.conf.state) {
+        case VMUX_PASSIVE: state = "passive"; break;
+        case VMUX_UP:      state = "up";      break;
+        case VMUX_DOWN:    state = "down";    break;
+        default:          return;
+    }
+    vx_toaddr(local, sizeof(local), &res->path.conf.local);
+    vx_toaddr(remote, sizeof(remote), &res->path.conf.remote);
+
+    if (vx_totime(beat, sizeof(beat), res->path.conf.beat / 1000))
+        return;
+
+    if (vx_torate(tx, sizeof(tx), res->path.conf.tx_max_rate * 8) ||
+        vx_torate(rx, sizeof(rx), res->path.conf.rx_max_rate * 8))
+        return;
+
+    if (res->path.conf.rtt_limit) {
+        if (vx_totime(rttlimit, sizeof(rttlimit), res->path.conf.rtt_limit / 1000))
+            return;
+    } else {
+        memcpy(rttlimit, "off", 4);
+    }
+
+    printf("path dev %s %s %s to addr %s port %"PRIu16" "
+           "set %s pref %u beat %s losslimit %u%% rttlimit %s mtu %"PRIu64
+           " rate %s tx %s rx %s%s\n",
+            res->tun_name, res->ifname[0] ? "via" : "addr",
+            res->ifname[0] ? res->ifname : local,
+            remote, vx_get_port(&res->path.conf.remote),
+            state, res->path.conf.pref, beat,
+            res->path.conf.loss_limit * 100U / 255U,
+            rttlimit,
+            res->path.conf.mtu,
+            res->path.conf.fixed_rate ? "fixed" : "auto",
+            tx, rx,
+            res->path.conf.monitor ? "  monitor" : "");
+}
+
+static int
+vx_path_status(int fd)
+{
+    struct ctl_msg res = {0};
+    static struct ctl_msg rows[VMUX_PATH_MAX * 2];
+    unsigned int count = 0;
+
+    for (unsigned int i = 0; i < VMUX_PATH_MAX * 2; i++) {
+        if (recv(fd, &res, sizeof(res), 0) == -1)
+            return -1;
+
+        if (res.type != CTL_PATH_STATUS) {
+            errno = EBADMSG;
+            return -1;
+        }
+        if (!res.ret)
+            break;
+
+        if (res.ret != EAGAIN) {
+            errno = res.ret;
+            return -1;
+        }
+        rows[count++] = res;
+    }
+    int printed[VMUX_PATH_MAX * 2] = {0};
+    unsigned int members[VMUX_PATH_MAX * 2];
+    double member_tx[VMUX_PATH_MAX * 2], member_rx[VMUX_PATH_MAX * 2];
+    const int use_color = isatty(STDOUT_FILENO);
+
+    for (unsigned int g = 0; g < count; g++) {
+        if (printed[g])
+            continue;
+
+        unsigned int member_count = 0;
+
+        /* Two passes, not one: the monitor sub-flow (there's normally just
+         * one per group) always lands first, right under the group header
+         * where the probe-loss/probe-status figures it drives are printed
+         * -- instead of wherever its socket index happens to fall among
+         * the data sub-flows, which is wherever `path up ... monitor` was
+         * typed relative to the others. Every other member keeps its
+         * existing relative order, just shifted after it. */
+        for (unsigned int j = g; j < count; j++) {
+            if (!printed[j] && vx_path_same_group(&rows[g], &rows[j]) &&
+                rows[j].path.conf.monitor)
+                members[member_count++] = j;
+        }
+        for (unsigned int j = g; j < count; j++) {
+            if (!printed[j] && vx_path_same_group(&rows[g], &rows[j]) &&
+                !rows[j].path.conf.monitor)
+                members[member_count++] = j;
+        }
+        char local[INET6_ADDRSTRLEN];
+        char remote[INET6_ADDRSTRLEN];
+        char index_str[16];
+
+        vx_toaddr(local, sizeof(local), &rows[g].path.conf.local);
+        vx_toaddr(remote, sizeof(remote), &rows[g].path.conf.remote);
+
+        if (rows[g].peer[0])
+            printf("[%s] ", rows[g].peer);
+
+        if (rows[g].ifindex)
+            snprintf(index_str, sizeof(index_str), "%u", rows[g].ifindex);
+        else
+            memcpy(index_str, "-", 2);
+
+        if (rows[g].path.conf.remote.sa.sa_family == AF_INET6)
+            printf("%s  index %s  %s -> [%s]:%"PRIu16,
+                   rows[g].ifname[0] ? rows[g].ifname : "-",
+                   index_str, local, remote,
+                   vx_get_port(&rows[g].path.conf.remote));
+        else
+            printf("%s  index %s  %s -> %s:%"PRIu16,
+                   rows[g].ifname[0] ? rows[g].ifname : "-",
+                   index_str, local, remote,
+                   vx_get_port(&rows[g].path.conf.remote));
+
+        /* One rate sample per member, taken here rather than inside
+         * vx_path_print_row() itself -- that used to compute its own,
+         * but each member's underlying tracker slot only ever advances
+         * once per vx_path_status() call (see vx_path_track_rate()'s own
+         * comment), so it has to be read exactly once per row per call.
+         * Reading it here lets the same numbers feed both this group
+         * total and the per-row print below, instead of calling it twice
+         * and getting a second, bogus near-zero-elapsed diff on the
+         * second call. */
+        double total_tx = 0, total_rx = 0;
+        int have_rate = 0;
+
+        for (unsigned int k = 0; k < member_count; k++) {
+            vx_path_track_rate(&rows[members[k]], &member_tx[k], &member_rx[k]);
+            if (member_tx[k] >= 0) {
+                total_tx += member_tx[k];
+                total_rx += member_rx[k];
+                have_rate = 1;
+            }
+        }
+
+        /* Pooled across every sub-flow of this physical link -- see struct
+         * vmux_path's group_rtt field (vmux.h). tx-loss/rx-loss used to be
+         * pooled and printed here too; removed entirely, not just hidden
+         * behind "n/a": `monitor` is mandatory on every path now, and vmux.c
+         * has stopped computing the byte-counter loss fields at all (see
+         * vmux_update_rl()'s own comment). Two probe figures now, not one:
+         * recv-loss is this side's own reading (what *we* receive from the
+         * peer); peer-loss is what the peer last reported about receiving
+         * from *us*. probe-status shown below reflects EITHER direction
+         * being over losslimit -- requested explicitly, since a link
+         * dropping packets in only one direction is still a degraded link
+         * from where you're sitting watching it. vmux_path_update()'s actual
+         * send/no-send decision stays keyed off peer-loss alone (see struct
+         * vmux_group's own comment in vmux.c on peer_probe_degraded): "should
+         * I keep sending this way" can only be answered by whoever is on
+         * the receiving end of that direction, so recv-loss alone never
+         * triggers failover, only the displayed status text. Any member row
+         * carries the same mirrored group_* values, so rows[g] (the
+         * group's first row) is as good as any. */
+        printf("  rtt %.3f", rows[g].path.group_rtt / 1e3);
+        if (have_rate) {
+            char totx_str[32], torx_str[32];
+
+            vx_path_format_mbps(totx_str, sizeof(totx_str), total_tx);
+            vx_path_format_mbps(torx_str, sizeof(torx_str), total_rx);
+            printf("  tx %s  rx %s", totx_str, torx_str);
+        } else {
+            printf("  tx -  rx -");
+        }
+        if (rows[g].path.group_probe_has_monitor) {
+            /* Color is a purely cosmetic overlay on top of the healthy/
+             * degraded text -- it never changes what that text says, only
+             * how it's highlighted, and neither one touches the actual
+             * failover decision (vmux.c's own peer_probe_degraded), which
+             * stays keyed off peer-loss alone regardless of what's shown
+             * here.
+             * healthy: green normally, yellow if some member is `late`
+             * (rtt_limit exceeded) -- late and lossy are two genuinely
+             * separate mechanisms in vmux.c (VMUX_LATE vs VMUX_LOSSY, checked
+             * independently in vmux_path_update()), so a group can be
+             * perfectly healthy on loss while still running high ping; the
+             * color says so without claiming the text is wrong.
+             * degraded: red only when *both* recv-loss and peer-loss are
+             * over losslimit (the link is bad in both directions at once)
+             * -- yellow for every other degraded case, including a `late`
+             * member, exactly one loss direction over the limit, or the
+             * proberecover hysteresis tail (still degraded seconds after
+             * the numbers themselves already read clean). rtt_limit never
+             * escalates degraded to red on its own, only ever to yellow --
+             * requested explicitly, since a link that's merely slow isn't
+             * the same problem as one that's genuinely dropping packets in
+             * both directions. */
+            int any_late = 0;
+
+            for (unsigned int k = 0; k < member_count; k++)
+                if (rows[members[k]].path.status == VMUX_LATE)
+                    any_late = 1;
+
+            /* Union of both latches, not just the peer one -- each side
+             * already has its own independent fast-degrade/slow-recover
+             * hysteresis in vmux.c (probe_degraded for recv, peer_probe_
+             * degraded for peer), so this reuses that debouncing rather
+             * than re-deriving a raw instantaneous threshold check here,
+             * which would flicker the text on every noisy sample instead
+             * of holding it through proberecover like the color's own
+             * recv_over/peer_over already do further down. */
+            const int degraded = rows[g].path.group_probe_degraded ||
+                                  rows[g].path.group_peer_probe_degraded;
+            const int recv_over = rows[g].path.group_probe_loss >
+                                   rows[g].path.conf.loss_limit;
+            const int peer_over = rows[g].path.group_peer_probe_loss >
+                                   rows[g].path.conf.loss_limit;
+            const char *color;
+
+            if (!degraded)
+                color = any_late ? VX_COLOR_YELLOW : VX_COLOR_GREEN;
+            else
+                color = (recv_over && peer_over) ? VX_COLOR_RED
+                                                  : VX_COLOR_YELLOW;
+
+            printf("  recv-loss %3.2f  peer-loss %3.2f  probe-status %s%s%s",
+                   rows[g].path.group_probe_loss * 100 / 255.0,
+                   rows[g].path.group_peer_probe_loss * 100 / 255.0,
+                   use_color ? color : "",
+                   degraded ? "degraded" : "healthy",
+                   use_color ? VX_COLOR_RESET : "");
+        } else {
+            printf("  probe-status no-monitor");
+        }
+        printf("\n");
+
+        for (unsigned int k = 0; k < member_count; k++) {
+            printed[members[k]] = 1;
+            vx_path_print_row(&rows[members[k]], member_tx[k], member_rx[k],
+                              k == member_count - 1);
+        }
+        printf("\n");
+    }
+    return 0;
+}
+
+static int
+vx_path_marker(int argc, char **argv, void *data)
+{
+    (void)argv;
+    (void)data;
+    return argc - 1;
+}
+
+int
+vx_path(int argc, char **argv, void *data)
+{
+    char *normalized[(argc * 2) + 1];
+    int normalized_argc = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (i > 1 && (!strcmp(argv[i - 1], "up") ||
+                      !strcmp(argv[i - 1], "down"))) {
+            struct in6_addr addr;
+            if (inet_pton(AF_INET, argv[i], &addr) == 1 ||
+                inet_pton(AF_INET6, argv[i], &addr) == 1)
+                normalized[normalized_argc++] = "addr";
+        }
+        normalized[normalized_argc++] = argv[i];
+    }
+    argc = normalized_argc;
+    argv = normalized;
+
+    struct argz_ull tx = {.suffix = argz_size_suffix};
+    struct argz_ull rx = {.suffix = argz_size_suffix};
+
+    struct argz ratez[] = {
+        {"fixed", "Fixed rate",                            .grp = 2},
+        {"auto",  "Dynamic rate detection (experimental)", .grp = 2},
+        {"tx",    "Maximum transmission rate",   argz_ull,      &tx},
+        {"rx",    "Maximum reception rate",      argz_ull,      &rx},
+        {0}};
+
+    struct argz_ull beat = {.suffix = argz_time_suffix};
+    struct argz_ull pref = {.max = 0xFF >> 1};
+    struct argz_ull connections = {.min = 1, .max = VMUX_SOCK_MAX};
+    struct argz_ull loss = {.max = 100, .suffix = vx_argz_percent_suffix};
+    struct argz_ull rttlimit = {.suffix = argz_time_suffix};
+    struct argz_ull mtu = {.max = VMUX_MTU_HARD_MAX};
+    struct argz_ull probeinterval = {.suffix = argz_time_suffix};
+    struct argz_ull probewindow  = {.min = 1, .max = VMUX_PROBE_RING_SIZE};
+    struct argz_ull proberecover = {.suffix = argz_time_suffix};
+
+    struct vx_argz_addr local = {0};
+    struct vx_argz_addr remote = {0};
+    const char *peer = NULL;
+    const char *dev = NULL;
+    char ifname[IFNAMSIZ] = {0};
+
+    struct argz z[] = {
+        {"dev",  "Select tunnel device",       vx_argz_dev,       &dev},
+        {"via",  "Select path by interface",   vx_argz_ifname, ifname,
+                                                            .grp = 2},
+        {"addr", "Select path by local addr",  vx_argz_addr_ip, &local,
+                                                            .grp = 2},
+        {"to",   "Select path by remote addr", vx_argz_addr,   &remote},
+        {"peer", "Only this client (multi-client tunnel)", argz_str, &peer},
+        {"set",  "Change path properties", vx_path_marker, NULL},
+        {"show", "Show path status",       vx_path_marker, NULL},
+        {"up",        "Enable path",                         .grp = 3},
+        {"down",      "Disable path",                        .grp = 3},
+        {"rate",      "Rate limit properties",  argz, &ratez},
+        {"beat",      "Internal beat rate", argz_ull,  &beat},
+        {"pref",      "Path preference",    argz_ull,  &pref},
+        {"connections", "Parallel UDP sub-flows for this path (default 1, "
+                        "requires via)",     argz_ull,  &connections},
+        {"losslimit", "Disable lossy path", argz_ull,  &loss},
+        {"rttlimit",  "Disable path if RTT exceeds this", argz_ull, &rttlimit},
+        {"mtu",  "Fixed MTU to use (wire size, default 1400)",
+                                                        argz_ull, &mtu},
+        {"monitor", "Dedicated health-probe sub-flow: never carries data, "
+                     "drives this path's group's losslimit decision via a "
+                     "fixed-interval sequence-numbered probe instead of "
+                     "data-traffic loss counters (requires via)"},
+        {"probeinterval", "Interval between probes on a monitor path "
+                           "(default 1s)",     argz_ull, &probeinterval},
+        {"probewindow", "Probe samples the loss percentage is computed "
+                         "over (default 60)",  argz_ull, &probewindow},
+        {"proberecover", "Time a monitor-degraded group must stay under "
+                          "losslimit before recovering (default 60s)",
+                                                argz_ull, &proberecover},
+        {"watch", "Refresh the view every second until interrupted"},
+        {0}};
+
+    int err = argz(argc, argv, z);
+
+    if (err)
+        return err;
+
+    int fd = ctl_connect(dev);
+
+    if (fd < 0) {
+        ctl_explain_connect(fd);
+        return -1;
+    }
+    int ret = 0;
+
+    int change = argz_is_set(z, "up") || argz_is_set(z, "down") ||
+                 argz_is_set(z, "rate") || argz_is_set(z, "beat") ||
+                 argz_is_set(z, "pref") || argz_is_set(z, "connections") ||
+                 argz_is_set(z, "losslimit") ||
+                 argz_is_set(z, "rttlimit") || argz_is_set(z, "mtu") ||
+                 argz_is_set(z, "monitor") ||
+                 argz_is_set(z, "probeinterval") ||
+                 argz_is_set(z, "probewindow") ||
+                 argz_is_set(z, "proberecover");
+    if (change && (argz_is_set(z, "show") ||
+                  argz_is_set(z, "watch"))) {
+        vx_log("Path changes and status views cannot be combined\n");
+        ctl_delete(fd);
+        return -1;
+    }
+    if (argz_is_set(z, "connections") && connections.value > 1 &&
+        !ifname[0]) {
+        vx_log("connections > 1 requires a path selected by 'via'\n");
+        ctl_delete(fd);
+        return -1;
+    }
+    if (argz_is_set(z, "monitor") && !ifname[0]) {
+        vx_log("monitor requires a path selected by 'via'\n");
+        ctl_delete(fd);
+        return -1;
+    }
+
+    if (peer && (change || strlen(peer) >= VMUX_HUB_NAME_MAX)) {
+        vx_log("peer only selects a client in status views; use 'peer set' "
+               "to change a client's settings\n");
+        ctl_delete(fd);
+        return -1;
+    }
+
+    if (change) {
+        struct ctl_msg req = {
+            .type = CTL_PATH_CONF,
+            .connections = argz_is_set(z, "connections")
+                          ? connections.value : 0,
+            .path.conf = {
+                .local       = local.sock,
+                .remote      = remote.sock,
+                .state       = VMUX_EMPTY,
+                .tx_max_rate = tx.value,
+                .rx_max_rate = rx.value,
+                .beat        = beat.value,
+                .pref        = argz_is_set(z, "pref")
+                             ? (pref.value << 1) | 1 : 0,
+                .loss_limit  = loss.value * 255 / 100,
+                .rtt_limit   = rttlimit.value,
+                .mtu         = mtu.value,
+                .monitor        = argz_is_set(z, "monitor") ? 1 : 0,
+                .probe_interval = probeinterval.value,
+                .probe_window   = probewindow.value,
+                .probe_recover  = proberecover.value,
+            },
+        }, res = {0};
+        memcpy(req.ifname, ifname, sizeof(req.ifname));
+
+        if (argz_is_set(z, "up"))
+            req.path.conf.state = VMUX_UP;
+
+        if (argz_is_set(z, "down"))
+            req.path.conf.state = VMUX_DOWN;
+
+        if (argz_is_set(ratez, "fixed"))
+            req.path.conf.fixed_rate = 3;
+
+        if (argz_is_set(ratez, "auto"))
+            req.path.conf.fixed_rate = 1;
+
+        ret = ctl_reply(fd, &res, &req);
+
+        if (!ret)
+            vx_path_conf(&res);
+    } else {
+        struct ctl_msg req = {
+            .type = CTL_PATH_STATUS,
+            .path.conf = {
+                .local  = local.sock,
+                .remote = remote.sock,
+            },
+        };
+        memcpy(req.ifname, ifname, sizeof(req.ifname));
+        if (peer)
+            memcpy(req.peer, peer, strlen(peer) + 1);
+
+        if (argz_is_set(z, "watch")) {
+            /* Alternate screen buffer (the same mechanism btop/htop/less
+             * use) -- entering it swaps to a separate screen that the
+             * terminal restores on exit, so every redraw below only ever
+             * touches that screen, never the scrollback history. Before
+             * this, each refresh cleared and redrew the *primary* screen
+             * in place (\033[H\033[J, cursor-home + clear), which looks
+             * identical while running but leaves every single frame
+             * sitting in scrollback -- confirmed live: Ctrl+C then
+             * scrolling up showed every past second's redraw, one after
+             * another, instead of nothing. Cursor hidden for the same
+             * reason a redrawing display normally hides it -- a visibly
+             * blinking cursor jumping to the top-left every second is
+             * itself distracting. Both are restored in the one exit path
+             * below, which every loop exit (error, Ctrl+C, or the peer
+             * going away) already funnels through. */
+            printf("\033[?1049h\033[?25l");
+            while (!vx_quit) {
+                if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
+                    ret = -1;
+                    break;
+                }
+                printf("\033[H\033[J");
+                printf("Every 1s: vortex path   Ctrl+C to stop\n\n");
+                ret = vx_path_status(fd);
+                fflush(stdout);
+
+                if (ret)
+                    break;
+
+                sleep(1);
+            }
+            printf("\033[?25h\033[?1049l");
+            fflush(stdout);
+            /* Ctrl+C during send/recv surfaces as EINTR -- that is the
+             * requested stop, not a failure worth reporting. */
+            if (vx_quit)
+                ret = 0;
+        } else {
+            if (send(fd, &req, sizeof(req), 0) != sizeof(req))
+                ret = -1;
+
+            if (!ret)
+                ret = vx_path_status(fd);
+        }
+    }
+    if (ret == -1 && errno)
+        perror("path");
+
+    ctl_delete(fd);
+
+    return ret;
+}
