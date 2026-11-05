@@ -66,8 +66,10 @@ The key features of Vortex come directly from vmux (derived from
 
 This build carries a few changes on top of upstream vortex/vmux, beyond the
 interface-rebinding patch (`vmux_rebind_path`, `via IFACE` path selection)
-this fork's `vmux` submodule already added. None of them touch the wire
-protocol, so they're safe to deploy on one end of a tunnel at a time.
+this fork's `vmux` submodule already added. One of them changes the wire
+protocol (the client identifier, see "Multi-client servers" below): **both
+ends of a tunnel must run a build that has it**. The others do not touch the
+protocol and are safe to deploy on one end at a time.
 
  * **Pinned rates actually stay pinned**
 
@@ -138,8 +140,11 @@ protocol, so they're safe to deploy on one end of a tunnel at a time.
 
 One server can serve many clients on a single port, each with its own key, rate
 limits, MTU and tunables, fully isolated from the others (`bind ... hub`,
-`peer add`, ...). Existing clients work unchanged. See
-[docs/multi-client.md](docs/multi-client.md).
+`peer add`, ...). Every control message carries a short client identifier (a
+hash of the client's key and a 5-minute time window), so the server finds the
+right client with one table lookup instead of trying every key. This changes
+the wire format: clients and servers built before it do not connect to ones
+built with it. See [docs/multi-client.md](docs/multi-client.md).
 
 ## Compatibility
 

@@ -35,8 +35,8 @@ struct vx_managed_path {
 };
 
 struct vx_path_manager {
-    struct vx_managed_path path[VMUX_PATH_MAX];
-    unsigned int count;
+    struct vx_managed_path *path; /* grows as sub-flows are added: no fixed limit */
+    unsigned int count, cap;
 };
 
 struct vx_managed_status {

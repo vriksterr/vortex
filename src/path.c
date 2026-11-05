@@ -261,7 +261,7 @@ vx_path_status(int fd)
 {
     struct ctl_msg res = {0};
     static struct ctl_msg rows[VMUX_PATH_MAX * 2];
-    unsigned int count = 0;
+    unsigned int count = 0, total = 0;
 
     for (unsigned int i = 0; i < VMUX_PATH_MAX * 2; i++) {
         if (recv(fd, &res, sizeof(res), 0) == -1)
@@ -271,8 +271,10 @@ vx_path_status(int fd)
             errno = EBADMSG;
             return -1;
         }
-        if (!res.ret)
+        if (!res.ret) {
+            total = res.connections;
             break;
+        }
 
         if (res.ret != EAGAIN) {
             errno = res.ret;
@@ -280,6 +282,10 @@ vx_path_status(int fd)
         }
         rows[count++] = res;
     }
+    if (total > count)
+        printf("note: %u paths in all; the list shows the first %u\n",
+               total, count);
+
     int printed[VMUX_PATH_MAX * 2] = {0};
     unsigned int members[VMUX_PATH_MAX * 2];
     double member_tx[VMUX_PATH_MAX * 2], member_rx[VMUX_PATH_MAX * 2];

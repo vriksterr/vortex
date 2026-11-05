@@ -6,19 +6,16 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-/* Bounds paths to a single peer (vmux is point-to-point), not a mesh.
- * Multiplied by sub-flow sockets per path (see VMUX_SOCK_MAX below): e.g.
- * 2-3 physical uplinks x several sub-flows each adds up quickly, and the
- * passive side mirrors the same count independently (one auto-discovered
- * path per distinct source port it observes). This ceiling is a
- * memory/lookup-cost tradeoff, not a hard resource
- * limit -- and unlike VMUX_SOCK_MAX below, raising it isn't free: every
- * packet's path lookup (vmux_get_path()) linearly scans this whole array
- * under state_lock, so a much larger value makes every packet slower to
- * process, not just startup memory bigger. Raised 64 -> 512 (8x) once
- * VMUX_SOCK_MAX (below) stopped being the binding constraint on real
- * sub-flow counts -- deliberately a smaller multiplier than that one, for
- * exactly this per-packet-cost reason. */
+/* There is no limit on the number of paths a tunnel can have (to a single peer;
+ * vmux is point-to-point, not a mesh): paths and groups are kept in chunks that
+ * grow as needed, a packet's path is found by a hash lookup, and the sending
+ * path is chosen by a binary search over running totals (see vmux_get_path()
+ * and vmux_select_path()). Memory is the only limit, apart from `maxpaths`,
+ * which a server can set per client.
+ *
+ * VMUX_PATH_MAX (512) is no longer a limit of the engine. It is how many paths
+ * one listing (`vortex path`) carries, through VMUX_PATH_LIST_MAX below; the
+ * listing says how many there are in all when it is cut short. */
 #define VMUX_PATH_MAX    (512U)
 /* Local UDP sockets one vmux instance may open, shared across every path --
  * not one-per-remote. Lets a single logical path be split into this many
@@ -411,9 +408,15 @@ struct vmux_errors {
     struct vmux_error keyx;
 };
 
+/* A listing of a tunnel's paths holds at most VMUX_PATH_LIST_MAX of them;
+ * `total` is how many there really are (there is no limit on the number of
+ * paths a tunnel can have, only on how many one listing carries). */
+#define VMUX_PATH_LIST_MAX VMUX_PATH_MAX
+
 struct vmux_paths {
-    struct vmux_path path[VMUX_PATH_MAX];
+    struct vmux_path path[VMUX_PATH_LIST_MAX];
     unsigned count;
+    unsigned total;
 };
 
 /* TUN access callbacks -- see vmux_worker_loop(). */

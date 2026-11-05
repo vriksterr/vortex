@@ -225,10 +225,16 @@ in the real implementation -- see the comment on `vx_bench_pool_worker()` in
 
 Making that safe required two changes to `struct vmux`'s internals:
 
-* **`vmux->paths` and `vmux->sock` are fixed-size arrays** (`VMUX_PATH_MAX`
-  paths, `VMUX_SOCK_MAX` sockets), allocated once in `vmux_create()`, never
-  `realloc()`'d. A pointer or index one worker thread is using can no
-  longer be invalidated by another thread growing the array underneath it.
+* **`vmux->sock` is a fixed-size array** (`VMUX_SOCK_MAX` sockets), allocated
+  once in `vmux_create()`, never `realloc()`'d. An index one worker thread is
+  using can no longer be invalidated by another thread growing the array
+  underneath it. Paths and groups are different: they are only touched under
+  `state_lock`, so they live in chunks that are allocated as the tunnel needs
+  them and never move (only the arrays of chunk pointers are reallocated). There
+  is no limit on the number of paths. A received packet's path is found with a
+  hash lookup (a cache of what identifies the path, checked against the path
+  itself; a miss falls back to a scan), and the sending path is chosen by a
+  binary search over prefix sums of the paths' weights, rebuilt every update.
   `connections N` (splitting a path into `N` independent UDP sub-flows,
   see `path up ... connections N` in the CLI reference) still works the
   same way from the outside -- `vmux_set_sock_count()` still grows

@@ -336,6 +336,7 @@ vx_hub_ctl(struct vmux_hub *hub, int ctl_fd, const char *tun_name, long pid,
         const unsigned int n = vmux_hub_peer_count(hub);
 
         res.ret = EAGAIN;
+        res.connections = 0;
         for (unsigned int i = 0; i < n; i++) {
             struct vmux_hub_peer_info info;
 
@@ -349,6 +350,7 @@ vx_hub_ctl(struct vmux_hub *hub, int ctl_fd, const char *tun_name, long pid,
             if (!m || vmux_get_paths(m, &paths, &req.path.conf.local,
                                     &req.path.conf.remote))
                 continue;
+            res.connections += paths.total;
 
             for (unsigned int k = 0; k < paths.count; k++) {
                 memset(res.ifname, 0, sizeof(res.ifname));

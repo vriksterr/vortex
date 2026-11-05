@@ -9,10 +9,13 @@
  * Packet identification (RX): a datagram's source address is looked up in a
  * lock-free cache that maps it to a peer. A hit goes straight to that peer's
  * session. A miss is only ever resolved for *control* messages -- a client's
- * paths always announce themselves with one before carrying data -- by
- * trying each peer's pre-shared key (cheap: control messages are small, and
- * this only runs for sources not already known). Data from an unknown source
- * is dropped. A client roaming to a new address is recognised the same way.
+ * paths always announce themselves with one before carrying data. Every
+ * control message ends with a short client identifier (a hash of the client's
+ * key and a 5-minute time window), which is looked up in a table to find the
+ * one client to check; the check itself is the decryption with that client's
+ * key, so a wrong or forged identifier gets nowhere. This only runs for
+ * sources not already known. Data from an unknown source is dropped. A client
+ * roaming to a new address is recognised the same way.
  *
  * Routing (TX): the inner destination address of each packet read from the
  * TUN selects the peer by longest-prefix match over the peers' allowed
@@ -25,9 +28,40 @@
  * housekeeping thread -- take admin_lock.
  * ========================================================================== */
 
-#define VMUX_HUB_SRC_CACHE     (4096U) /* power of two */
-#define VMUX_HUB_IDENT_PER_SEC (2000U)
-#define VMUX_HUB_GRAVE_MAX     (256U)
+/* There is no fixed limit on the number of clients: peer slots live in chunks
+ * that are allocated as the client count grows (a slot never moves, so workers
+ * can keep reading them without a lock). The only ceiling is the chunk-pointer
+ * array below, about a billion clients, far past what memory would allow. */
+#define VMUX_HUB_CHUNK_BITS    (10U)
+#define VMUX_HUB_CHUNK         (1U << VMUX_HUB_CHUNK_BITS)
+#define VMUX_HUB_CHUNKS_MAX    (1U << 20)
+
+/* Source-address cache: starts small and grows with the client count (see
+ * vmux_hub_cache_grow()). Power of two. */
+#define VMUX_HUB_SRC_CACHE_MIN (4096U)
+#define VMUX_HUB_SRC_CACHE_MAX (1U << 26)
+/* Each identification costs one table lookup and one decryption now, not a
+ * decryption per client, so the flood limit can be much higher. */
+#define VMUX_HUB_IDENT_PER_SEC (20000U)
+/* Anything replaced or removed while workers may still be reading it (tables,
+ * route snapshots, a removed client's session) is parked this long before it
+ * is freed. */
+#ifndef VMUX_HUB_RETIRE_KEEP
+#define VMUX_HUB_RETIRE_KEEP   (60 * VMUX_ONE_SEC)
+#endif
+
+/* Open-addressing table of client identifiers. e[2*i] is the identifier (0 =
+ * empty slot), e[2*i+1] the owning peer's slot index + 1. It holds, for every
+ * active client, the identifiers of the time windows around `window`, so a
+ * client whose clock is somewhat off is still found. Immutable once
+ * published. */
+struct vmux_hub_idtab {
+    unsigned int mask; /* number of entries - 1, a power of two minus one */
+    unsigned int used; /* entries ever filled in (dead ones included); admin only */
+    unsigned int span; /* windows on each side of `window` that are included */
+    uint64_t window;   /* the window the table is centred on */
+    uint64_t e[];
+};
 #define VMUX_HUB_QLEN          (128U)   /* packets a client may have waiting */
 #define VMUX_HUB_QSLOT         (2048U)  /* larger packets are never queued */
 #define VMUX_HUB_QMIN_BYTES    (32768U)
@@ -43,7 +77,13 @@ struct vmux_hub_routes {
     struct vmux_prefix prefix[VMUX_HUB_ALLOWED_MAX];
 };
 
+struct vmux_hub;
+
 struct vmux_hub_peer {
+    unsigned int index;            /* this slot's number, fixed */
+    struct vmux_hub *hub;
+    int dirty_reorder;             /* atomic: packets may be waiting in its reorder buffers */
+    int dirty_q;                   /* atomic: packets may be waiting in its shaping queue */
     char name[VMUX_HUB_NAME_MAX];
     int used;
     int active;                    /* atomic */
@@ -62,6 +102,24 @@ struct vmux_hub_peer {
     unsigned int q_count;          /* atomic mirror of q->count */
 };
 
+/* Source address -> client cache. A word is the high 32 bits of the source
+ * hash (a tag) and the client's slot number + 1 in the low 32 bits. */
+struct vmux_hub_cache {
+    unsigned int mask;
+    uint64_t e[];
+};
+
+enum { VMUX_RETIRE_FREE, VMUX_RETIRE_SESSION };
+
+struct vmux_hub_retired {
+    void *ptr;
+    int kind;
+    uint64_t time;
+    struct vmux_hub_peer *slot; /* for a session: the slot that pointed at it */
+};
+
+struct vmux_hub_rtab;
+
 struct vmux_hub {
     int sock[VMUX_SOCK_MAX];
     unsigned int sock_count;
@@ -70,21 +128,246 @@ struct vmux_hub {
     int aes;
     struct vmux_conf defaults;
     pthread_mutex_t admin_lock;
-    struct vmux_hub_peer peer[VMUX_HUB_PEERS_MAX];
+    struct vmux_hub_peer **chunk;   /* VMUX_HUB_CHUNKS_MAX pointers, filled on demand */
+    unsigned int *chunk_dirty;      /* [kind][chunk]: how many slots of the chunk are flagged */
     unsigned int peer_hwm; /* atomic: slots ever used */
-    uint64_t srccache[VMUX_HUB_SRC_CACHE]; /* atomic words */
-    struct vmux *grave[VMUX_HUB_GRAVE_MAX];
-    unsigned int grave_count;
-    struct vmux_hub_routes *routes_grave[VMUX_HUB_GRAVE_MAX];
-    unsigned int routes_grave_count;
+    struct vmux_hub_cache *srccache; /* atomic */
+    struct vmux_hub_retired *retired; /* guarded by admin_lock */
+    unsigned int retired_count, retired_cap;
+    unsigned int *free_slots;       /* reusable slot numbers, guarded by admin_lock */
+    unsigned int free_count, free_cap;
     uint64_t tx_drop_noroute; /* atomic counters */
     uint64_t rx_drop_unknown;
     uint64_t rx_drop_limited;
     uint64_t ident_sec;
     uint64_t ident_count;
+    /* Client identifier table (see vmux_hub_idtab_rebuild()). idtab is read
+     * without a lock by every worker; a replaced table is kept for a while
+     * (idtab_old) before it is freed, in case a worker is still looking
+     * something up in it. */
+    struct vmux_hub_idtab *idtab;
+    struct vmux_hub_rtab *rtab;     /* route index, see vmux_hub_route() */
+    unsigned int rt_cnt[2][129];     /* prefixes per length (v4, v6); admin only */
+    uint64_t rt_bits[2][3];          /* lengths that have any; atomic */
 };
 
+static void vmux_hub_idtab_rebuild(struct vmux_hub *hub);
+static void vmux_hub_rt_add(struct vmux_hub *hub, const struct vmux_hub_peer *p);
+static void vmux_hub_rt_del(struct vmux_hub *hub, const struct vmux_hub_peer *p,
+                           const struct vmux_hub_routes *r);
+static void vmux_hub_id_add(struct vmux_hub *hub, const struct vmux_hub_peer *p);
+static void vmux_hub_id_del(struct vmux_hub *hub, const struct vmux_hub_peer *p);
+
 #define VMUX_AINC(P) ((void)__atomic_fetch_add((P), 1, __ATOMIC_RELAXED))
+
+/* The slot with this number, or NULL if it does not exist (yet). */
+static inline struct vmux_hub_peer *
+vmux_hub_peer_at(const struct vmux_hub *hub, unsigned int i)
+{
+    const unsigned int c = i >> VMUX_HUB_CHUNK_BITS;
+
+    if (c >= VMUX_HUB_CHUNKS_MAX)
+        return NULL;
+
+    struct vmux_hub_peer *chunk = __atomic_load_n(&hub->chunk[c], __ATOMIC_ACQUIRE);
+
+    return chunk ? &chunk[i & (VMUX_HUB_CHUNK - 1U)] : NULL;
+}
+
+/* Which clients have work waiting. Walking every client on each pass of every
+ * worker would cost more and more as clients are added, so a client flags itself
+ * when it buffers a packet (reorder buffers, kind VMUX_HUB_DIRTY_REORDER) or
+ * queues one for its rate limit (VMUX_HUB_DIRTY_Q), and the workers only visit
+ * flagged clients. A per-chunk count lets whole chunks with nothing flagged be
+ * skipped. Whoever clears a flag must look again afterwards and set it if work
+ * is still pending; whoever adds work sets it after adding. */
+#define VMUX_HUB_DIRTY_REORDER 0
+#define VMUX_HUB_DIRTY_Q       1
+
+static inline int *
+vmux_hub_dirty_flag(struct vmux_hub_peer *p, int kind)
+{
+    return kind == VMUX_HUB_DIRTY_Q ? &p->dirty_q : &p->dirty_reorder;
+}
+
+static void
+vmux_hub_mark(struct vmux_hub *hub, struct vmux_hub_peer *p, int kind)
+{
+    if (__atomic_exchange_n(vmux_hub_dirty_flag(p, kind), 1, __ATOMIC_ACQ_REL) == 0)
+        __atomic_fetch_add(&hub->chunk_dirty[(size_t)kind * VMUX_HUB_CHUNKS_MAX +
+                                             (p->index >> VMUX_HUB_CHUNK_BITS)],
+                           1U, __ATOMIC_RELAXED);
+}
+
+static int
+vmux_hub_unmark(struct vmux_hub *hub, struct vmux_hub_peer *p, int kind)
+{
+    if (__atomic_exchange_n(vmux_hub_dirty_flag(p, kind), 0, __ATOMIC_ACQ_REL) == 0)
+        return 0;
+
+    __atomic_fetch_sub(&hub->chunk_dirty[(size_t)kind * VMUX_HUB_CHUNKS_MAX +
+                                         (p->index >> VMUX_HUB_CHUNK_BITS)],
+                       1U, __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* The next flagged client at or after *cursor, or NULL. */
+static struct vmux_hub_peer *
+vmux_hub_dirty_next(struct vmux_hub *hub, int kind, unsigned int *cursor)
+{
+    const unsigned int hwm = __atomic_load_n(&hub->peer_hwm, __ATOMIC_ACQUIRE);
+    unsigned int i = *cursor;
+
+    while (i < hwm) {
+        if (!(i & (VMUX_HUB_CHUNK - 1U)) &&
+            !__atomic_load_n(&hub->chunk_dirty[(size_t)kind * VMUX_HUB_CHUNKS_MAX +
+                                               (i >> VMUX_HUB_CHUNK_BITS)],
+                             __ATOMIC_RELAXED)) {
+            i += VMUX_HUB_CHUNK;
+            continue;
+        }
+        struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i++);
+
+        if (p && __atomic_load_n(vmux_hub_dirty_flag(p, kind), __ATOMIC_ACQUIRE)) {
+            *cursor = i;
+            return p;
+        }
+    }
+    *cursor = i;
+    return NULL;
+}
+
+/* Whether a client still has anything in its reorder buffers. */
+static int
+vmux_hub_reorder_pending(struct vmux *vmux)
+{
+    struct vmux_reorder *ro = &vmux->reorder;
+
+    pthread_mutex_lock(&ro->lock);
+
+    const int pending = ro->count || ro->seq_count;
+
+    pthread_mutex_unlock(&ro->lock);
+    return pending;
+}
+
+/* A steady clock for retirement ages: the wall clock may jump. */
+static uint64_t
+vmux_hub_mono(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * VMUX_ONE_SEC + (uint64_t)ts.tv_nsec / 1000U;
+}
+
+/* Parks something that workers may still be reading (a replaced table or route
+ * snapshot, a removed client's session) until it is safe to free it. For a
+ * session, `slot` is the slot that points at it. Caller holds admin_lock. If
+ * memory for the list runs out the item is simply never freed. */
+static void
+vmux_hub_retire(struct vmux_hub *hub, void *ptr, int kind,
+               struct vmux_hub_peer *slot)
+{
+    if (!ptr)
+        return;
+
+    if (hub->retired_count == hub->retired_cap) {
+        const unsigned int cap = hub->retired_cap ? hub->retired_cap * 2U : 64U;
+        struct vmux_hub_retired *n = realloc(hub->retired, cap * sizeof(*n));
+
+        if (!n)
+            return;
+        hub->retired = n;
+        hub->retired_cap = cap;
+    }
+    struct vmux_hub_retired *e = &hub->retired[hub->retired_count++];
+
+    e->ptr = ptr;
+    e->kind = kind;
+    e->slot = slot;
+    e->time = vmux_hub_mono();
+}
+
+/* Remembers a slot that can take a new client. Caller holds admin_lock. */
+static void
+vmux_hub_free_slot_push(struct vmux_hub *hub, unsigned int index)
+{
+    if (hub->free_count == hub->free_cap) {
+        const unsigned int cap = hub->free_cap ? hub->free_cap * 2U : 64U;
+        unsigned int *n = realloc(hub->free_slots, cap * sizeof(*n));
+
+        if (!n)
+            return;
+        hub->free_slots = n;
+        hub->free_cap = cap;
+    }
+    hub->free_slots[hub->free_count++] = index;
+}
+
+/* Frees whatever has been parked long enough. A removed client's slot is made
+ * reusable here, once its session is really gone. Caller holds admin_lock. */
+static void
+vmux_hub_reap(struct vmux_hub *hub)
+{
+    const uint64_t now = vmux_hub_mono();
+    unsigned int keep = 0;
+
+    for (unsigned int i = 0; i < hub->retired_count; i++) {
+        struct vmux_hub_retired *e = &hub->retired[i];
+
+        if (now - e->time <= VMUX_HUB_RETIRE_KEEP) {
+            hub->retired[keep++] = *e;
+            continue;
+        }
+        if (e->kind == VMUX_RETIRE_SESSION) {
+            struct vmux_hub_peer *s = e->slot;
+
+            if (s && __atomic_load_n(&s->vmux, __ATOMIC_ACQUIRE) == e->ptr) {
+                __atomic_store_n(&s->vmux, NULL, __ATOMIC_RELEASE);
+                if (!VMUX_ALOAD(&s->active)) {
+                    /* nobody is using the slot any more: make it anonymous
+                     * so the name can be used again, and hand it out again */
+                    free(s->routes);
+                    s->routes = NULL;
+                    s->used = 0;
+                    s->name[0] = 0;
+                    vmux_hub_free_slot_push(hub, s->index);
+                }
+            }
+            vmux_delete(e->ptr);
+        } else {
+            free(e->ptr);
+        }
+    }
+    hub->retired_count = keep;
+}
+
+/* Makes the source cache bigger once there are many clients, so that a client's
+ * sources are not constantly pushed out. Entries are not copied: the next
+ * control message of each client puts it back. Caller holds admin_lock. */
+static void
+vmux_hub_cache_grow(struct vmux_hub *hub)
+{
+    struct vmux_hub_cache *old = __atomic_load_n(&hub->srccache, __ATOMIC_ACQUIRE);
+    size_t want = (size_t)old->mask + 1U;
+    const size_t need = (size_t)hub->peer_hwm * 64U;
+
+    while (want < need && want < VMUX_HUB_SRC_CACHE_MAX)
+        want <<= 1;
+
+    if (want == (size_t)old->mask + 1U)
+        return;
+
+    struct vmux_hub_cache *c = calloc(1, sizeof(*c) + want * sizeof(uint64_t));
+
+    if (!c)
+        return;
+
+    c->mask = (unsigned int)(want - 1U);
+    __atomic_store_n(&hub->srccache, c, __ATOMIC_RELEASE);
+    vmux_hub_retire(hub, old, VMUX_RETIRE_FREE, NULL);
+}
 
 static uint64_t
 vmux_hub_mix(uint64_t h, const void *data, size_t n)
@@ -121,19 +404,21 @@ vmux_hub_src_hash(const union vmux_sockaddr *a)
 static struct vmux_hub_peer *
 vmux_hub_cache_get(struct vmux_hub *hub, uint64_t h)
 {
-    const uint64_t tag = h & ~UINT64_C(0xFF);
-    const unsigned int i0 = (unsigned int)h & (VMUX_HUB_SRC_CACHE - 1U);
+    const struct vmux_hub_cache *c = __atomic_load_n(&hub->srccache, __ATOMIC_ACQUIRE);
+    const uint64_t tag = h & ~UINT64_C(0xFFFFFFFF);
+    const unsigned int i0 = (unsigned int)h & c->mask;
 
     for (unsigned int k = 0; k < 2; k++) {
-        const uint64_t w = VMUX_ALOAD(&hub->srccache[i0 ^ k]);
+        const uint64_t w = VMUX_ALOAD(&c->e[i0 ^ k]);
 
-        if (!w || (w & ~UINT64_C(0xFF)) != tag)
+        if (!w || (w & ~UINT64_C(0xFFFFFFFF)) != tag)
             continue;
 
-        const unsigned int idx = (unsigned int)(w & 0xFF) - 1U;
+        const unsigned int idx = (unsigned int)(w & 0xFFFFFFFFU) - 1U;
+        struct vmux_hub_peer *p = vmux_hub_peer_at(hub, idx);
 
-        if (idx < VMUX_HUB_PEERS_MAX && VMUX_ALOAD(&hub->peer[idx].active))
-            return &hub->peer[idx];
+        if (p && VMUX_ALOAD(&p->active))
+            return p;
     }
     return NULL;
 }
@@ -141,19 +426,20 @@ vmux_hub_cache_get(struct vmux_hub *hub, uint64_t h)
 static void
 vmux_hub_cache_put(struct vmux_hub *hub, uint64_t h, unsigned int idx)
 {
-    const uint64_t tag = h & ~UINT64_C(0xFF);
+    struct vmux_hub_cache *c = __atomic_load_n(&hub->srccache, __ATOMIC_ACQUIRE);
+    const uint64_t tag = h & ~UINT64_C(0xFFFFFFFF);
     const uint64_t word = tag | (uint64_t)(idx + 1U);
-    const unsigned int i0 = (unsigned int)h & (VMUX_HUB_SRC_CACHE - 1U);
+    const unsigned int i0 = (unsigned int)h & c->mask;
 
     for (unsigned int k = 0; k < 2; k++) {
-        const uint64_t w = VMUX_ALOAD(&hub->srccache[i0 ^ k]);
+        const uint64_t w = VMUX_ALOAD(&c->e[i0 ^ k]);
 
-        if (!w || (w & ~UINT64_C(0xFF)) == tag) {
-            VMUX_ASTORE(&hub->srccache[i0 ^ k], word);
+        if (!w || (w & ~UINT64_C(0xFFFFFFFF)) == tag) {
+            VMUX_ASTORE(&c->e[i0 ^ k], word);
             return;
         }
     }
-    VMUX_ASTORE(&hub->srccache[i0], word); /* evict */
+    VMUX_ASTORE(&c->e[i0], word); /* evict */
 }
 
 static int
@@ -213,6 +499,190 @@ vmux_prefix_same(const struct vmux_prefix *a, const struct vmux_prefix *b)
     return !memcmp(x.addr, y.addr, total);
 }
 
+/* Route index: finds the client that owns an inner destination address with a
+ * few hash lookups instead of scanning every client's prefixes. One entry per
+ * allowed prefix: the key is the family, length and masked address (see
+ * vmux_rt_key()), the value the owning slot + 1 (0 = removed). Entries are
+ * added and removed in place; readers take no lock (value is written before
+ * the key, which is published with release ordering). A hit is always checked
+ * against the client's real prefix list, so a hash collision cannot send a
+ * packet to the wrong client. Which prefix lengths exist is kept in a bit set so
+ * a lookup only tries those, longest first. */
+struct vmux_hub_rtab {
+    unsigned int mask;
+    unsigned int used; /* entries ever filled in (dead ones included); admin only */
+    uint64_t e[];
+};
+
+static uint64_t
+vmux_rt_key(int family, unsigned int len, const unsigned char *addr)
+{
+    unsigned char m[16] = {0};
+    const size_t total = (family == AF_INET) ? 4U : 16U;
+    const unsigned int bytes = len / 8U, bits = len % 8U;
+
+    memcpy(m, addr, total);
+
+    if (bits)
+        m[bytes] &= (unsigned char)(0xFFU << (8U - bits));
+
+    for (size_t i = bytes + (bits ? 1U : 0U); i < total; i++)
+        m[i] = 0;
+
+    if (family == AF_INET) {
+        uint32_t a;
+
+        memcpy(&a, m, sizeof(a));
+        return (UINT64_C(1) << 63) | ((uint64_t)len << 32) | a;
+    }
+    uint64_t h = vmux_hub_mix(UINT64_C(14695981039346656037) ^ len, m, sizeof(m));
+
+    h ^= h >> 29;
+    h *= UINT64_C(0xBF58476D1CE4E5B9);
+    h ^= h >> 32;
+    return (h & ~(UINT64_C(1) << 63)) | (UINT64_C(1) << 62);
+}
+
+static void
+vmux_rt_count(struct vmux_hub *hub, int family, unsigned int len, int delta)
+{
+    const int f = (family == AF_INET) ? 0 : 1;
+    uint64_t *w = &hub->rt_bits[f][len / 64U];
+    uint64_t v = *w;
+
+    hub->rt_cnt[f][len] += delta;
+
+    if (hub->rt_cnt[f][len])
+        v |= UINT64_C(1) << (len % 64U);
+    else
+        v &= ~(UINT64_C(1) << (len % 64U));
+
+    __atomic_store_n(w, v, __ATOMIC_RELEASE);
+}
+
+static void
+vmux_rt_insert(struct vmux_hub_rtab *t, uint64_t key, uint64_t value)
+{
+    unsigned int k = (unsigned int)key & t->mask;
+
+    while (t->e[2 * k])
+        k = (k + 1) & t->mask;
+
+    __atomic_store_n(&t->e[2 * k + 1], value, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->e[2 * k], key, __ATOMIC_RELEASE);
+    t->used++;
+}
+
+/* Rebuilds the route index from every active client's prefixes. Done when the
+ * index is full; individual changes go through vmux_hub_rt_add/del. Caller
+ * holds admin_lock. */
+static void
+vmux_hub_rt_rebuild(struct vmux_hub *hub)
+{
+    size_t total = 0;
+
+    for (unsigned int i = 0; i < hub->peer_hwm; i++) {
+        const struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
+
+        if (p->active && p->routes)
+            total += p->routes->count;
+    }
+    size_t entries = 64;
+
+    while (entries < total * 4)
+        entries <<= 1;
+
+    struct vmux_hub_rtab *t = calloc(1, sizeof(*t) + entries * 2 * sizeof(uint64_t));
+
+    if (!t)
+        return;
+
+    t->mask = (unsigned int)(entries - 1);
+    memset(hub->rt_cnt, 0, sizeof(hub->rt_cnt));
+
+    for (unsigned int i = 0; i < hub->peer_hwm; i++) {
+        const struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
+
+        if (!p->active || !p->routes)
+            continue;
+
+        for (unsigned int k = 0; k < p->routes->count; k++) {
+            const struct vmux_prefix *x = &p->routes->prefix[k];
+
+            vmux_rt_insert(t, vmux_rt_key(x->family, x->len, x->addr),
+                           (uint64_t)p->index + 1U);
+            hub->rt_cnt[x->family == AF_INET ? 0 : 1][x->len]++;
+        }
+    }
+    for (int f = 0; f < 2; f++) {
+        for (unsigned int w = 0; w < 3; w++) {
+            uint64_t bits = 0;
+
+            for (unsigned int b = 0; b < 64U; b++) {
+                const unsigned int len = w * 64U + b;
+
+                if (len <= 128U && hub->rt_cnt[f][len])
+                    bits |= UINT64_C(1) << b;
+            }
+            __atomic_store_n(&hub->rt_bits[f][w], bits, __ATOMIC_RELEASE);
+        }
+    }
+    struct vmux_hub_rtab *old = hub->rtab;
+
+    __atomic_store_n(&hub->rtab, t, __ATOMIC_RELEASE);
+    vmux_hub_retire(hub, old, VMUX_RETIRE_FREE, NULL);
+}
+
+/* Adds a client's current prefixes to the index. Caller holds admin_lock. */
+static void
+vmux_hub_rt_add(struct vmux_hub *hub, const struct vmux_hub_peer *p)
+{
+    struct vmux_hub_rtab *t = hub->rtab;
+    const struct vmux_hub_routes *r = p->routes;
+
+    if (!r || !r->count)
+        return;
+
+    if (!t || (size_t)(t->used + r->count) * 2U > (size_t)t->mask + 1U) {
+        vmux_hub_rt_rebuild(hub); /* includes this client */
+        return;
+    }
+    for (unsigned int k = 0; k < r->count; k++) {
+        const struct vmux_prefix *x = &r->prefix[k];
+
+        vmux_rt_insert(t, vmux_rt_key(x->family, x->len, x->addr),
+                       (uint64_t)p->index + 1U);
+        vmux_rt_count(hub, x->family, x->len, 1);
+    }
+}
+
+/* Removes the prefixes `r` of a client from the index. Caller holds
+ * admin_lock. */
+static void
+vmux_hub_rt_del(struct vmux_hub *hub, const struct vmux_hub_peer *p,
+               const struct vmux_hub_routes *r)
+{
+    struct vmux_hub_rtab *t = hub->rtab;
+
+    if (!t || !r)
+        return;
+
+    for (unsigned int i = 0; i < r->count; i++) {
+        const struct vmux_prefix *x = &r->prefix[i];
+        const uint64_t key = vmux_rt_key(x->family, x->len, x->addr);
+
+        for (unsigned int k = (unsigned int)key & t->mask; t->e[2 * k];
+             k = (k + 1) & t->mask) {
+            if (t->e[2 * k] == key &&
+                t->e[2 * k + 1] == (uint64_t)p->index + 1U) {
+                __atomic_store_n(&t->e[2 * k + 1], 0, __ATOMIC_RELEASE);
+                vmux_rt_count(hub, x->family, x->len, -1);
+                break;
+            }
+        }
+    }
+}
+
 /* Longest-prefix match of a packet's inner destination over every active
  * peer's allowed prefixes. NULL when nobody owns it. */
 static struct vmux_hub_peer *
@@ -220,41 +690,64 @@ vmux_hub_route(struct vmux_hub *hub, const unsigned char *pkt, size_t size)
 {
     int family;
     const unsigned char *dst;
+    unsigned int f, words;
 
     if (size >= 20 && (pkt[0] >> 4) == 4) {
         family = AF_INET;
         dst = pkt + 16;
+        f = 0;
+        words = 1;
     } else if (size >= 40 && (pkt[0] >> 4) == 6) {
         family = AF_INET6;
         dst = pkt + 24;
+        f = 1;
+        words = 3;
     } else {
         return NULL;
     }
-    const unsigned int n = __atomic_load_n(&hub->peer_hwm, __ATOMIC_ACQUIRE);
-    struct vmux_hub_peer *best = NULL;
-    int best_len = -1;
+    const struct vmux_hub_rtab *t = __atomic_load_n(&hub->rtab, __ATOMIC_ACQUIRE);
 
-    for (unsigned int i = 0; i < n; i++) {
-        struct vmux_hub_peer *p = &hub->peer[i];
+    if (!t)
+        return NULL;
 
-        if (!VMUX_ALOAD(&p->active))
-            continue;
+    for (unsigned int w = words; w > 0; w--) {
+        uint64_t bits = __atomic_load_n(&hub->rt_bits[f][w - 1U], __ATOMIC_ACQUIRE);
 
-        const struct vmux_hub_routes *r =
-            __atomic_load_n(&p->routes, __ATOMIC_ACQUIRE);
+        while (bits) {
+            const unsigned int b = 63U - (unsigned int)__builtin_clzll(bits);
+            const unsigned int len = (w - 1U) * 64U + b;
+            const uint64_t key = vmux_rt_key(family, len, dst);
 
-        if (!r)
-            continue;
+            bits &= ~(UINT64_C(1) << b);
 
-        for (unsigned int k = 0; k < r->count; k++) {
-            if ((int)r->prefix[k].len > best_len &&
-                vmux_prefix_match(&r->prefix[k], family, dst)) {
-                best_len = r->prefix[k].len;
-                best = p;
+            for (unsigned int k = (unsigned int)key & t->mask;
+                 __atomic_load_n(&t->e[2 * k], __ATOMIC_ACQUIRE);
+                 k = (k + 1) & t->mask) {
+                if (t->e[2 * k] != key)
+                    continue;
+
+                const uint64_t v = __atomic_load_n(&t->e[2 * k + 1], __ATOMIC_ACQUIRE);
+
+                if (!v)
+                    continue;
+
+                struct vmux_hub_peer *p = vmux_hub_peer_at(hub, (unsigned int)(v - 1U));
+
+                if (!p || !VMUX_ALOAD(&p->active))
+                    continue;
+
+                const struct vmux_hub_routes *r =
+                    __atomic_load_n(&p->routes, __ATOMIC_ACQUIRE);
+
+                for (unsigned int i = 0; r && i < r->count; i++) {
+                    if (r->prefix[i].len == len &&
+                        vmux_prefix_match(&r->prefix[i], family, dst))
+                        return p;
+                }
             }
         }
     }
-    return best;
+    return NULL;
 }
 
 /* Anti-spoofing: the inner source of a packet received from `p` must be an
@@ -302,8 +795,8 @@ vmux_hub_find(struct vmux_hub *hub, const char *name)
     const unsigned int n = __atomic_load_n(&hub->peer_hwm, __ATOMIC_ACQUIRE);
 
     for (unsigned int i = 0; i < n; i++) {
-        if (hub->peer[i].used && !strcmp(hub->peer[i].name, name))
-            return &hub->peer[i];
+        if (vmux_hub_peer_at(hub, i)->used && !strcmp(vmux_hub_peer_at(hub, i)->name, name))
+            return vmux_hub_peer_at(hub, i);
     }
     return NULL;
 }
@@ -324,7 +817,7 @@ vmux_hub_name_valid(const char *name)
 }
 
 /* Builds an immutable route snapshot. The previous one is parked in
- * routes_grave (workers may still be reading it) and freed at hub delete.
+ * the retired list (workers may still be reading it) and freed later.
  * Caller holds admin_lock. */
 static struct vmux_hub_routes *
 vmux_hub_routes_new(struct vmux_hub *hub, const struct vmux_prefix *allowed,
@@ -339,8 +832,6 @@ vmux_hub_routes_new(struct vmux_hub *hub, const struct vmux_prefix *allowed,
     if (count)
         memcpy(r->prefix, allowed, count * sizeof(*allowed));
 
-    if (hub->routes_grave_count < VMUX_HUB_GRAVE_MAX)
-        hub->routes_grave[hub->routes_grave_count++] = r;
     return r;
 }
 
@@ -362,16 +853,29 @@ vmux_hub_check_allowed(struct vmux_hub *hub, const struct vmux_hub_peer *self,
                 return EINVAL;
         }
     }
-    const unsigned int n = hub->peer_hwm;
+    /* is any of these prefixes already owned by another client? One lookup in
+     * the route index each, not a scan of every client. */
+    const struct vmux_hub_rtab *t = hub->rtab;
 
-    for (unsigned int i = 0; i < n; i++) {
-        const struct vmux_hub_peer *p = &hub->peer[i];
+    if (!t)
+        return 0;
 
-        if (p == self || !p->active || !p->routes)
-            continue;
+    for (unsigned int k = 0; k < count; k++) {
+        const uint64_t key = vmux_rt_key(allowed[k].family, allowed[k].len,
+                                         allowed[k].addr);
 
-        for (unsigned int a = 0; a < p->routes->count; a++) {
-            for (unsigned int k = 0; k < count; k++) {
+        for (unsigned int j = (unsigned int)key & t->mask; t->e[2 * j];
+             j = (j + 1) & t->mask) {
+            if (t->e[2 * j] != key || !t->e[2 * j + 1])
+                continue;
+
+            const struct vmux_hub_peer *p =
+                vmux_hub_peer_at(hub, (unsigned int)(t->e[2 * j + 1] - 1U));
+
+            if (!p || p == self || !p->active || !p->routes)
+                continue;
+
+            for (unsigned int a = 0; a < p->routes->count; a++) {
                 if (vmux_prefix_same(&p->routes->prefix[a], &allowed[k]))
                     return EADDRINUSE;
             }
@@ -397,12 +901,12 @@ vmux_policy_merge(struct vmux_policy *dst, const struct vmux_policy *src)
 static struct vmux *
 vmux_hub_session_new(struct vmux_hub *hub, const unsigned char *key)
 {
-    struct vmux *vmux = calloc(1, sizeof(*vmux));
+    struct vmux *vmux = vmux_pool_alloc();
 
     if (!vmux)
         return NULL;
 
-    vmux->heap_calloc = 1;
+    vmux->pooled = 1;
     vmux->borrowed_socks = 1;
 
     if (pthread_mutex_init(&vmux->state_lock, NULL))
@@ -414,7 +918,8 @@ vmux_hub_session_new(struct vmux_hub *hub, const unsigned char *key)
     if (pthread_mutex_init(&vmux->reorder.flush_lock, NULL))
         goto err3;
 
-    vmux->capacity = VMUX_PATH_MAX;
+    vmux->capacity = 0;
+    vmux->path_limit = VMUX_PATH_UNLIMITED;
 
     for (unsigned int i = 0; i < hub->sock_count; i++)
         vmux->sock[i] = hub->sock[i];
@@ -438,6 +943,7 @@ vmux_hub_session_new(struct vmux_hub *hub, const unsigned char *key)
     }
     memcpy(vmux->keyx.private.encrypt.key, key, VMUX_KEY_SIZE);
     memcpy(vmux->keyx.private.decrypt.key, key, VMUX_KEY_SIZE);
+    vmux_id_init(vmux, key);
     vmux->keyx.current = vmux->keyx.private;
     vmux->keyx.next = vmux->keyx.private;
     vmux->keyx.last = vmux->keyx.private;
@@ -462,7 +968,7 @@ err2:
 err1:
     pthread_mutex_destroy(&vmux->state_lock);
 err0:
-    free(vmux);
+    vmux_pool_free(vmux);
     return NULL;
 }
 
@@ -501,10 +1007,20 @@ vmux_hub_create(union vmux_sockaddr *addr, int *aes)
         free(hub);
         return NULL;
     }
-    for (unsigned int i = 0; i < VMUX_HUB_PEERS_MAX; i++)
-        pthread_mutex_init(&hub->peer[i].q_lock, NULL);
-    for (unsigned int i = 0; i < VMUX_HUB_PEERS_MAX; i++)
-        pthread_mutex_init(&hub->peer[i].rx_lock, NULL);
+    hub->chunk = calloc(VMUX_HUB_CHUNKS_MAX, sizeof(*hub->chunk));
+    hub->chunk_dirty = calloc(2U * VMUX_HUB_CHUNKS_MAX, sizeof(*hub->chunk_dirty));
+    hub->srccache = calloc(1, sizeof(*hub->srccache) +
+                              VMUX_HUB_SRC_CACHE_MIN * sizeof(uint64_t));
+
+    if (!hub->chunk || !hub->chunk_dirty || !hub->srccache) {
+        free(hub->chunk);
+        free(hub->chunk_dirty);
+        free(hub->srccache);
+        pthread_mutex_destroy(&hub->admin_lock);
+        free(hub);
+        return NULL;
+    }
+    hub->srccache->mask = VMUX_HUB_SRC_CACHE_MIN - 1U;
     const int fd0 = socket(addr->sa.sa_family, SOCK_DGRAM, IPPROTO_UDP);
 
     if ((fd0 == -1) ||
@@ -513,8 +1029,9 @@ vmux_hub_create(union vmux_sockaddr *addr, int *aes)
         (getsockname(fd0, &addr->sa, &addrlen))) {
         if (fd0 != -1)
             close(fd0);
-        for (unsigned int i = 0; i < VMUX_HUB_PEERS_MAX; i++)
-            pthread_mutex_destroy(&hub->peer[i].q_lock);
+        free(hub->chunk);
+        free(hub->chunk_dirty);
+        free(hub->srccache);
         pthread_mutex_destroy(&hub->admin_lock);
         free(hub);
         return NULL;
@@ -569,21 +1086,39 @@ vmux_hub_delete(struct vmux_hub *hub)
     if (!hub)
         return;
 
+    /* sessions parked for removal first, then what each slot still points at */
+    for (unsigned int i = 0; i < hub->retired_count; i++) {
+        struct vmux_hub_retired *e = &hub->retired[i];
+
+        if (e->kind == VMUX_RETIRE_SESSION) {
+            if (e->slot)
+                e->slot->vmux = NULL;
+            vmux_delete(e->ptr);
+        } else {
+            free(e->ptr);
+        }
+    }
+    free(hub->retired);
+    free(hub->free_slots);
+
     for (unsigned int i = 0; i < hub->peer_hwm; i++) {
-        if (hub->peer[i].vmux)
-            vmux_delete(hub->peer[i].vmux);
-    }
-    for (unsigned int i = 0; i < hub->grave_count; i++)
-        vmux_delete(hub->grave[i]);
+        struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
 
-    for (unsigned int i = 0; i < hub->routes_grave_count; i++)
-        free(hub->routes_grave[i]);
-
-    for (unsigned int i = 0; i < VMUX_HUB_PEERS_MAX; i++) {
-        free(hub->peer[i].q);
-        pthread_mutex_destroy(&hub->peer[i].q_lock);
-        pthread_mutex_destroy(&hub->peer[i].rx_lock);
+        if (p->vmux)
+            vmux_delete(p->vmux);
+        free(p->routes);
+        free(p->q);
+        pthread_mutex_destroy(&p->q_lock);
+        pthread_mutex_destroy(&p->rx_lock);
     }
+    for (unsigned int c = 0; c < VMUX_HUB_CHUNKS_MAX && hub->chunk[c]; c++)
+        free(hub->chunk[c]);
+
+    free(hub->idtab);
+    free(hub->rtab);
+    free(hub->srccache);
+    free(hub->chunk_dirty);
+    free(hub->chunk);
 
     for (unsigned int i = 0; i < hub->sock_count; i++) {
         if (hub->sock[i] >= 0)
@@ -591,6 +1126,62 @@ vmux_hub_delete(struct vmux_hub *hub)
     }
     pthread_mutex_destroy(&hub->admin_lock);
     free(hub);
+}
+
+/* Whether an active client already uses this key. The identifier a key gives
+ * for the table's current window is looked up, and only the clients it points to
+ * have their key compared; no scan of every client. */
+static int
+vmux_hub_key_in_use(struct vmux_hub *hub, const unsigned char *key)
+{
+    const struct vmux_hub_idtab *t = hub->idtab;
+    unsigned char idkey[VMUX_KEY_SIZE], id[VMUX_ID_SIZE];
+
+    if (!t)
+        return 0;
+
+    vmux_id_derive(idkey, key);
+    vmux_id_compute(idkey, t->window, id);
+    sodium_memzero(idkey, sizeof(idkey));
+
+    const uint64_t want = vmux_id_key(id);
+
+    for (unsigned int k = (unsigned int)want & t->mask; t->e[2 * k];
+         k = (k + 1) & t->mask) {
+        if (t->e[2 * k] != want || !t->e[2 * k + 1])
+            continue;
+
+        const struct vmux_hub_peer *p =
+            vmux_hub_peer_at(hub, (unsigned int)(t->e[2 * k + 1] - 1U));
+
+        if (p && p->active && p->vmux &&
+            !sodium_memcmp(p->vmux->keyx.private.encrypt.key, key, VMUX_KEY_SIZE))
+            return 1;
+    }
+    return 0;
+}
+
+/* Allocates chunk `c` of peer slots (see VMUX_HUB_CHUNK_BITS). Caller holds
+ * admin_lock. Returns 0 or an errno value. */
+static int
+vmux_hub_chunk_add(struct vmux_hub *hub, unsigned int c)
+{
+    if (c >= VMUX_HUB_CHUNKS_MAX)
+        return ENOSPC;
+
+    struct vmux_hub_peer *ch = calloc(VMUX_HUB_CHUNK, sizeof(*ch));
+
+    if (!ch)
+        return ENOMEM;
+
+    for (unsigned int i = 0; i < VMUX_HUB_CHUNK; i++) {
+        ch[i].index = (c << VMUX_HUB_CHUNK_BITS) + i;
+        ch[i].hub = hub;
+        pthread_mutex_init(&ch[i].q_lock, NULL);
+        pthread_mutex_init(&ch[i].rx_lock, NULL);
+    }
+    __atomic_store_n(&hub->chunk[c], ch, __ATOMIC_RELEASE);
+    return 0;
 }
 
 int
@@ -618,19 +1209,21 @@ vmux_hub_peer_add(struct vmux_hub *hub, const char *name,
     /* One pre-shared key per client: it is what identifies a roaming or
      * newly-appeared source as belonging to this client, so two clients
      * sharing one would be indistinguishable. */
-    for (unsigned int i = 0; i < hub->peer_hwm; i++) {
-        const struct vmux_hub_peer *p = &hub->peer[i];
-
-        if (p->active &&
-            !sodium_memcmp(p->vmux->keyx.private.encrypt.key, key,
-                           VMUX_KEY_SIZE)) {
-            err = EKEYREJECTED;
-            goto out;
-        }
-    }
-    if (!slot && hub->peer_hwm >= VMUX_HUB_PEERS_MAX) {
-        err = ENOSPC;
+    if (vmux_hub_key_in_use(hub, key)) {
+        err = EKEYREJECTED;
         goto out;
+    }
+    /* Where the client will live: its old slot (a removed client coming
+     * back), a slot freed by a removed client, or a new one. The room for a
+     * new one is made now, before anything else can fail. */
+    unsigned int new_index = 0;
+
+    if (!slot && !hub->free_count) {
+        new_index = hub->peer_hwm;
+
+        if (!vmux_hub_peer_at(hub, new_index) &&
+            (err = vmux_hub_chunk_add(hub, new_index >> VMUX_HUB_CHUNK_BITS)))
+            goto out;
     }
     struct vmux *vmux = vmux_hub_session_new(hub, key);
 
@@ -651,12 +1244,15 @@ vmux_hub_peer_add(struct vmux_hub *hub, const char *name,
         goto out;
     }
     if (slot) {
-        /* A removed client coming back: workers may still hold the old
-         * session, so it is parked rather than freed. */
-        if (hub->grave_count < VMUX_HUB_GRAVE_MAX)
-            hub->grave[hub->grave_count++] = slot->vmux;
+        /* A removed client coming back: its old session is already parked
+         * for removal; the old route snapshot is parked now. */
+        vmux_hub_retire(hub, slot->routes, VMUX_RETIRE_FREE, NULL);
+    } else if (hub->free_count) {
+        slot = vmux_hub_peer_at(hub, hub->free_slots[--hub->free_count]);
+        memcpy(slot->name, name, strlen(name) + 1);
+        slot->used = 1;
     } else {
-        slot = &hub->peer[hub->peer_hwm];
+        slot = vmux_hub_peer_at(hub, new_index);
         memcpy(slot->name, name, strlen(name) + 1);
         slot->used = 1;
     }
@@ -668,12 +1264,13 @@ vmux_hub_peer_add(struct vmux_hub *hub, const char *name,
     __atomic_store_n(&slot->vmux, vmux, __ATOMIC_RELEASE);
     __atomic_store_n(&slot->routes, routes, __ATOMIC_RELEASE);
 
-    if ((unsigned int)(slot - hub->peer) >= hub->peer_hwm)
-        __atomic_store_n(&hub->peer_hwm,
-                         (unsigned int)(slot - hub->peer) + 1U,
-                         __ATOMIC_RELEASE);
+    if (slot->index >= hub->peer_hwm)
+        __atomic_store_n(&hub->peer_hwm, slot->index + 1U, __ATOMIC_RELEASE);
 
     __atomic_store_n(&slot->active, 1, __ATOMIC_RELEASE);
+    vmux_hub_cache_grow(hub);
+    vmux_hub_id_add(hub, slot);
+    vmux_hub_rt_add(hub, slot);
 out:
     pthread_mutex_unlock(&hub->admin_lock);
     if (err) {
@@ -714,7 +1311,12 @@ vmux_hub_peer_set(struct vmux_hub *hub, const char *name,
             err = ENOMEM;
             goto out;
         }
+        struct vmux_hub_routes *old_routes = p->routes;
+
+        vmux_hub_rt_del(hub, p, old_routes);
         __atomic_store_n(&p->routes, r, __ATOMIC_RELEASE);
+        vmux_hub_rt_add(hub, p);
+        vmux_hub_retire(hub, old_routes, VMUX_RETIRE_FREE, NULL);
     }
     if (set || unset) {
         struct vmux_policy cur;
@@ -752,10 +1354,16 @@ vmux_hub_peer_del(struct vmux_hub *hub, const char *name)
     struct vmux_hub_peer *p = vmux_hub_find(hub, name);
     int err = 0;
 
-    if (!p || !p->active)
+    if (!p || !p->active) {
         err = ENOENT;
-    else
+    } else {
         __atomic_store_n(&p->active, 0, __ATOMIC_RELEASE);
+        vmux_hub_id_del(hub, p);
+        vmux_hub_rt_del(hub, p, p->routes);
+        /* workers may still be using the session for a moment: it is freed
+         * (and the slot made reusable) after a while, by vmux_hub_reap() */
+        vmux_hub_retire(hub, p->vmux, VMUX_RETIRE_SESSION, p);
+    }
 
     pthread_mutex_unlock(&hub->admin_lock);
     if (err) {
@@ -790,7 +1398,7 @@ vmux_hub_peer_info(struct vmux_hub *hub, unsigned int slot,
         errno = EINVAL;
         return -1;
     }
-    struct vmux_hub_peer *p = &hub->peer[slot];
+    struct vmux_hub_peer *p = vmux_hub_peer_at(hub, slot);
     struct vmux *vmux = __atomic_load_n(&p->vmux, __ATOMIC_ACQUIRE);
 
     memset(info, 0, sizeof(*info));
@@ -809,7 +1417,7 @@ vmux_hub_peer_info(struct vmux_hub *hub, unsigned int slot,
         info->policy = vmux->policy;
         info->conf = vmux->conf;
         for (unsigned int i = 0; i < vmux->capacity; i++) {
-            if (vmux->paths[i].conf.state != VMUX_EMPTY)
+            if (vmux_path_at(vmux, i)->conf.state != VMUX_EMPTY)
                 info->path_count++;
         }
         pthread_mutex_unlock(&vmux->state_lock);
@@ -854,15 +1462,29 @@ vmux_hub_get_stats(struct vmux_hub *hub, struct vmux_hub_stats *st)
 int
 vmux_hub_update(struct vmux_hub *hub)
 {
+    /* the identifiers change every VMUX_ID_WINDOW: renew the table when the
+     * window has moved on */
+    const struct vmux_hub_idtab *t = __atomic_load_n(&hub->idtab, __ATOMIC_ACQUIRE);
+
+    pthread_mutex_lock(&hub->admin_lock);
+    if (!t || t->window != vmux_id_window(vmux_time()))
+        vmux_hub_idtab_rebuild(hub);
+    vmux_hub_reap(hub);
+    pthread_mutex_unlock(&hub->admin_lock);
     const unsigned int n = vmux_hub_peer_count(hub);
 
     for (unsigned int i = 0; i < n; i++) {
-        struct vmux_hub_peer *p = &hub->peer[i];
+        struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
 
         if (!VMUX_ALOAD(&p->active))
             continue;
 
         struct vmux *vmux = __atomic_load_n(&p->vmux, __ATOMIC_ACQUIRE);
+
+        /* a client that has never had a path has nothing to update; without
+         * this every idle registered client would cost a little on each pass */
+        if (!__atomic_load_n(&vmux->capacity, __ATOMIC_RELAXED))
+            continue;
 
         vmux_update(vmux);
         VMUX_ASTORE(&p->tx_mtu, vmux_get_mtu(vmux));
@@ -881,7 +1503,7 @@ vmux_hub_get_mtu(struct vmux_hub *hub)
     size_t mtu = 0;
 
     for (unsigned int i = 0; i < n; i++) {
-        const struct vmux_hub_peer *p = &hub->peer[i];
+        const struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
         const size_t m = VMUX_ALOAD(&p->tx_mtu);
 
         if (VMUX_ALOAD(&p->active) && m > mtu)
@@ -902,8 +1524,134 @@ vmux_hub_get_fd(struct vmux_hub *hub, unsigned int sock)
     return (hub && sock < hub->sock_count) ? hub->sock[sock] : -1;
 }
 
-/* Finds which peer a control message from a not-yet-known source belongs
- * to, by trying each peer's pre-shared key. Rate-limited so a flood of junk
+/* Rebuilds the identifier table from scratch for every active client and
+ * publishes it. Done when the time window moves on (the identifiers of every
+ * client change) and when the table has filled up; adding or removing one
+ * client only touches that client's entries (vmux_hub_id_add/del). The table
+ * holds the identifiers for the windows around the current one (as many as the
+ * clock tolerance allows), so a client whose clock is a few minutes off is
+ * still found. Caller holds admin_lock. */
+static void
+vmux_hub_idtab_rebuild(struct vmux_hub *hub)
+{
+    const uint64_t centre = vmux_id_window(vmux_time());
+    uint64_t span = hub->defaults.timetolerance / VMUX_ID_WINDOW + 1;
+
+    if (span > 20)
+        span = 20;
+
+    const unsigned int windows = (unsigned int)(2 * span + 1);
+    size_t active = 0;
+
+    for (unsigned int i = 0; i < hub->peer_hwm; i++) {
+        if (vmux_hub_peer_at(hub, i)->active)
+            active++;
+    }
+    /* room to grow: it is rebuilt when it passes half full */
+    size_t entries = 16;
+
+    while (entries < (active ? active : 1) * windows * 4)
+        entries <<= 1;
+
+    struct vmux_hub_idtab *t = calloc(1, sizeof(*t) + entries * 2 * sizeof(uint64_t));
+
+    if (!t)
+        return; /* keep the current table; the next change tries again */
+
+    t->mask = (unsigned int)(entries - 1);
+    t->window = centre;
+    t->span = (unsigned int)span;
+
+    for (unsigned int i = 0; i < hub->peer_hwm; i++) {
+        const struct vmux_hub_peer *p = vmux_hub_peer_at(hub, i);
+
+        if (!p->active || !p->vmux)
+            continue;
+
+        for (unsigned int w = 0; w < windows; w++) {
+            unsigned char id[VMUX_ID_SIZE];
+
+            vmux_id_compute(p->vmux->idkey, centre - span + w, id);
+
+            const uint64_t key = vmux_id_key(id);
+            unsigned int k = (unsigned int)key & t->mask;
+
+            while (t->e[2 * k])
+                k = (k + 1) & t->mask;
+
+            t->e[2 * k] = key;
+            t->e[2 * k + 1] = (uint64_t)i + 1;
+            t->used++;
+        }
+    }
+    struct vmux_hub_idtab *old = hub->idtab;
+
+    __atomic_store_n(&hub->idtab, t, __ATOMIC_RELEASE);
+    vmux_hub_retire(hub, old, VMUX_RETIRE_FREE, NULL);
+}
+
+/* Adds one client's identifiers to the published table in place. A reader sees
+ * an entry only once both of its words are written (value first, then the key
+ * with release ordering). Caller holds admin_lock; the client is already
+ * active. */
+static void
+vmux_hub_id_add(struct vmux_hub *hub, const struct vmux_hub_peer *p)
+{
+    struct vmux_hub_idtab *t = hub->idtab;
+
+    if (!t || (size_t)(t->used + 2U * t->span + 1U) * 2U > (size_t)t->mask + 1U) {
+        vmux_hub_idtab_rebuild(hub);
+        return;
+    }
+    for (unsigned int w = 0; w <= 2U * t->span; w++) {
+        unsigned char id[VMUX_ID_SIZE];
+
+        vmux_id_compute(p->vmux->idkey, t->window - t->span + w, id);
+
+        const uint64_t key = vmux_id_key(id);
+        unsigned int k = (unsigned int)key & t->mask;
+
+        while (t->e[2 * k])
+            k = (k + 1) & t->mask;
+
+        __atomic_store_n(&t->e[2 * k + 1], (uint64_t)p->index + 1U, __ATOMIC_RELAXED);
+        __atomic_store_n(&t->e[2 * k], key, __ATOMIC_RELEASE);
+        t->used++;
+    }
+}
+
+/* Removes one client's identifiers from the published table: the entries stay
+ * as dead slots (value 0) until the next rebuild. Caller holds admin_lock. */
+static void
+vmux_hub_id_del(struct vmux_hub *hub, const struct vmux_hub_peer *p)
+{
+    struct vmux_hub_idtab *t = hub->idtab;
+
+    if (!t || !p->vmux)
+        return;
+
+    for (unsigned int w = 0; w <= 2U * t->span; w++) {
+        unsigned char id[VMUX_ID_SIZE];
+
+        vmux_id_compute(p->vmux->idkey, t->window - t->span + w, id);
+
+        const uint64_t key = vmux_id_key(id);
+
+        for (unsigned int k = (unsigned int)key & t->mask; t->e[2 * k];
+             k = (k + 1) & t->mask) {
+            if (t->e[2 * k] == key &&
+                t->e[2 * k + 1] == (uint64_t)p->index + 1U) {
+                __atomic_store_n(&t->e[2 * k + 1], 0, __ATOMIC_RELEASE);
+                break;
+            }
+        }
+    }
+}
+
+/* Finds which client a control message from a not-yet-known source belongs
+ * to. The message ends with a client identifier, which is looked up in the
+ * identifier table; only the client(s) it points to are tried for the real
+ * check, the decryption with that client's key. Rate-limited so a flood of junk
  * from unknown addresses cannot turn into unbounded crypto work. */
 static struct vmux_hub_peer *
 vmux_hub_identify(struct vmux_hub *hub, const unsigned char *packet,
@@ -922,17 +1670,37 @@ vmux_hub_identify(struct vmux_hub *hub, const unsigned char *packet,
         VMUX_AINC(&hub->rx_drop_limited);
         return NULL;
     }
-    const unsigned int n = vmux_hub_peer_count(hub);
+    if (size < VMUX_PKT_MIN_SIZE + VMUX_ID_SIZE)
+        return NULL;
 
-    for (unsigned int i = 0; i < n; i++) {
-        struct vmux_hub_peer *p = &hub->peer[i];
+    const struct vmux_hub_idtab *t = __atomic_load_n(&hub->idtab, __ATOMIC_ACQUIRE);
 
-        if (!VMUX_ALOAD(&p->active))
+    if (!t)
+        return NULL;
+
+    const uint64_t key = vmux_id_key(packet + size - VMUX_ID_SIZE);
+
+    for (unsigned int k = (unsigned int)key & t->mask;
+         __atomic_load_n(&t->e[2 * k], __ATOMIC_ACQUIRE);
+         k = (k + 1) & t->mask) {
+        if (t->e[2 * k] != key)
+            continue;
+
+        const uint64_t v = __atomic_load_n(&t->e[2 * k + 1], __ATOMIC_ACQUIRE);
+
+        if (!v)
+            continue; /* removed */
+
+        const uint64_t slot = v - 1;
+
+        struct vmux_hub_peer *p = (slot < UINT_MAX) ? vmux_hub_peer_at(hub, (unsigned int)slot) : NULL;
+
+        if (!p || !VMUX_ALOAD(&p->active))
             continue;
 
         struct vmux *vmux = __atomic_load_n(&p->vmux, __ATOMIC_ACQUIRE);
 
-        if (vmux_decrypt_msg(vmux, scratch, cap, packet, size))
+        if (vmux_decrypt_msg(vmux, scratch, cap, packet, size - VMUX_ID_SIZE))
             return p;
     }
     return NULL;
@@ -941,33 +1709,36 @@ vmux_hub_identify(struct vmux_hub *hub, const unsigned char *packet,
 static void
 vmux_hub_flush_all(struct vmux_hub *hub, int tun_fd, vmux_tun_write_fn tun_write)
 {
-    const unsigned int n = vmux_hub_peer_count(hub);
+    unsigned int cur = 0;
+    struct vmux_hub_peer *p;
 
-    for (unsigned int i = 0; i < n; i++) {
-        struct vmux_hub_peer *p = &hub->peer[i];
+    while ((p = vmux_hub_dirty_next(hub, VMUX_HUB_DIRTY_REORDER, &cur))) {
+        if (!vmux_hub_unmark(hub, p, VMUX_HUB_DIRTY_REORDER))
+            continue;
 
         if (!VMUX_ALOAD(&p->active))
             continue;
 
         struct vmux *vmux = __atomic_load_n(&p->vmux, __ATOMIC_ACQUIRE);
 
-        if (!VMUX_ALOAD(&vmux->conf.reorder_window))
-            continue;
-
-        vmux_reorder_flush(vmux, tun_fd, tun_write);
-        vmux_seq_flush(vmux, tun_fd, tun_write);
+        if (VMUX_ALOAD(&vmux->conf.reorder_window)) {
+            vmux_reorder_flush(vmux, tun_fd, tun_write);
+            vmux_seq_flush(vmux, tun_fd, tun_write);
+        }
+        /* look again: whatever is still buffered has to be flushed later */
+        if (vmux_hub_reorder_pending(vmux))
+            vmux_hub_mark(hub, p, VMUX_HUB_DIRTY_REORDER);
     }
 }
 
 static int
 vmux_hub_poll_timeout(struct vmux_hub *hub, int idle_ms)
 {
-    const unsigned int n = vmux_hub_peer_count(hub);
     int timeout = idle_ms;
+    unsigned int cur = 0;
+    struct vmux_hub_peer *p;
 
-    for (unsigned int i = 0; i < n; i++) {
-        struct vmux_hub_peer *p = &hub->peer[i];
-
+    while ((p = vmux_hub_dirty_next(hub, VMUX_HUB_DIRTY_REORDER, &cur))) {
         if (!VMUX_ALOAD(&p->active))
             continue;
 
@@ -975,10 +1746,11 @@ vmux_hub_poll_timeout(struct vmux_hub *hub, int idle_ms)
 
         if (VMUX_ALOAD(&vmux->conf.reorder_window))
             timeout = vmux_reorder_poll_timeout(vmux, timeout);
-        /* packets are waiting for tokens: look again in a millisecond */
-        if (VMUX_ALOAD(&p->q_count) && timeout > 1)
-            timeout = 1;
     }
+    /* packets are waiting for tokens: look again in a millisecond */
+    cur = 0;
+    if (timeout > 1 && vmux_hub_dirty_next(hub, VMUX_HUB_DIRTY_Q, &cur))
+        timeout = 1;
     return timeout;
 }
 
@@ -1068,6 +1840,7 @@ vmux_hub_q_push(struct vmux_hub_peer *hp, struct vmux *pm,
     q->bytes += len;
     VMUX_ASTORE(&hp->q_count, q->count);
     pthread_mutex_unlock(&hp->q_lock);
+    vmux_hub_mark(hp->hub, hp, VMUX_HUB_DIRTY_Q);
     return 1;
 }
 
@@ -1128,16 +1901,20 @@ static void
 vmux_hub_drain(struct vmux_hub *hub, struct vmux_worker_scratch *sc,
               unsigned char *buf)
 {
-    const unsigned int count = vmux_hub_peer_count(hub);
+    unsigned int cur = 0;
+    struct vmux_hub_peer *hp;
 
-    for (unsigned int i = 0; i < count; i++) {
-        struct vmux_hub_peer *hp = &hub->peer[i];
+    while ((hp = vmux_hub_dirty_next(hub, VMUX_HUB_DIRTY_Q, &cur))) {
+        if (!vmux_hub_unmark(hub, hp, VMUX_HUB_DIRTY_Q))
+            continue;
 
         if (!VMUX_ALOAD(&hp->active) || !VMUX_ALOAD(&hp->q_count))
             continue;
 
-        if (pthread_mutex_trylock(&hp->q_lock))
+        if (pthread_mutex_trylock(&hp->q_lock)) {
+            vmux_hub_mark(hub, hp, VMUX_HUB_DIRTY_Q);
             continue;
+        }
 
         struct vmux *pm = __atomic_load_n(&hp->vmux, __ATOMIC_ACQUIRE);
         struct vmux_hub_q *q = hp->q;
@@ -1162,6 +1939,9 @@ vmux_hub_drain(struct vmux_hub *hub, struct vmux_worker_scratch *sc,
         }
         VMUX_ASTORE(&hp->q_count, q ? q->count : 0);
         pthread_mutex_unlock(&hp->q_lock);
+
+        if (VMUX_ALOAD(&hp->q_count))
+            vmux_hub_mark(hub, hp, VMUX_HUB_DIRTY_Q);
 
         if (tx_n)
             vmux_hub_tx_flush(sc, key, tx_n);
@@ -1372,6 +2152,10 @@ vmux_hub_worker_loop(struct vmux_hub *hub, unsigned int worker_index,
                 const uint64_t h = vmux_hub_src_hash(&rs->remote);
                 struct vmux_hub_peer *hp = vmux_hub_cache_get(hub, h);
 
+                /* a control message ends with a client identifier */
+                if (ctl && (size_t)rs->len < VMUX_PKT_MIN_SIZE + VMUX_ID_SIZE)
+                    continue;
+
                 /* A cached source still has to prove it is that peer: a
                  * control message is cheap to verify, and a mismatch means
                  * the address now belongs to someone else (a re-used NAT
@@ -1379,7 +2163,7 @@ vmux_hub_worker_loop(struct vmux_hub *hub, unsigned int worker_index,
                 if (hp && ctl &&
                     !vmux_decrypt_msg(__atomic_load_n(&hp->vmux, __ATOMIC_ACQUIRE),
                                      out, sizeof(out), rs->packet,
-                                     (size_t)rs->len))
+                                     (size_t)rs->len - VMUX_ID_SIZE))
                     hp = NULL;
 
                 if (!hp) {
@@ -1393,7 +2177,7 @@ vmux_hub_worker_loop(struct vmux_hub *hub, unsigned int worker_index,
                         VMUX_AINC(&hub->rx_drop_unknown);
                         continue;
                     }
-                    vmux_hub_cache_put(hub, h, (unsigned int)(hp - hub->peer));
+                    vmux_hub_cache_put(hub, h, hp->index);
                 }
                 struct vmux *pm = __atomic_load_n(&hp->vmux, __ATOMIC_ACQUIRE);
                 uint64_t path_hold;
@@ -1417,16 +2201,18 @@ vmux_hub_worker_loop(struct vmux_hub *hub, unsigned int worker_index,
                     VMUX_AINC(&hp->rx_drop_rate);
                     continue;
                 }
-                if (stamped) {
-                    if (!VMUX_ALOAD(&pm->conf.reorder_window) ||
-                        !vmux_seq_insert(pm, seq, path_hold, vmux_now(pm),
-                                        out, (size_t)wn))
-                        tun_write(tun_fds[0], out, (size_t)wn);
-                    continue;
-                }
-                if (!VMUX_ALOAD(&pm->conf.reorder_window) ||
-                    !vmux_reorder_insert(pm, path_hold, vmux_now(pm),
-                                        out, (size_t)wn))
+                int buffered = 0;
+
+                if (VMUX_ALOAD(&pm->conf.reorder_window))
+                    buffered = stamped
+                        ? vmux_seq_insert(pm, seq, path_hold, vmux_now(pm),
+                                         out, (size_t)wn)
+                        : vmux_reorder_insert(pm, path_hold, vmux_now(pm),
+                                             out, (size_t)wn);
+
+                if (buffered)
+                    vmux_hub_mark(hub, hp, VMUX_HUB_DIRTY_REORDER);
+                else
                     tun_write(tun_fds[0], out, (size_t)wn);
             }
         }

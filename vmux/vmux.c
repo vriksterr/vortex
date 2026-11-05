@@ -22,6 +22,7 @@
 #endif
 
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 
 #include <arpa/inet.h>
@@ -76,6 +77,14 @@
 
 #define VMUX_KEY_SIZE (32U)
 #define VMUX_MAC_SIZE (16U)
+
+/* Every control message ends with a client identifier: a hash of the client key
+ * and a coarse time window (see vmux_id_compute()), so a hub can find the right
+ * session with one table lookup instead of trying every client key. It is not
+ * authenticated by itself: a wrong or forged one just fails the normal
+ * decryption with that client key. */
+#define VMUX_ID_SIZE   (8U)
+#define VMUX_ID_WINDOW (5 * VMUX_ONE_MIN)
 
 #define VMUX_MSG(X)       ((X) & UINT64_C(1))
 #define VMUX_MSG_MARK(X)  ((X) | UINT64_C(1))
@@ -407,7 +416,7 @@ struct vmux_seq_slot {
  * back into the single TUN device, not before. See
  * vmux_reorder_insert()/vmux_reorder_flush() and vmux_conf.reorder_window. */
 struct vmux_reorder {
-    struct vmux_reorder_slot slot[VMUX_REORDER_MAX];
+    struct vmux_reorder_slot *slot; /* VMUX_REORDER_MAX entries, allocated when first needed */
     unsigned count;
     uint64_t next_deadline;    /* earliest slot[].deadline currently held
                                  * (0 = buffer empty), kept current by
@@ -422,7 +431,9 @@ struct vmux_reorder {
     /* Everything below is the sequence-numbered path's own state (see
      * struct vmux_seq_slot) -- entirely separate storage and bookkeeping
      * from slot[]/count/next_deadline above, guarded by the same lock. */
-    struct vmux_seq_slot seq_ring[VMUX_SEQ_RING_SIZE]; /* ~8.5MB, same
+    struct vmux_seq_slot *seq_ring; /* VMUX_SEQ_RING_SIZE entries (~8.5MB), allocated
+                                 * when first needed: most clients never buffer
+                                 * anything, and a hub may hold thousands. Same
                                  * always-allocated-with-struct-vmux rationale
                                  * as slot[] above and struct vmux's own
                                  * comment; trivial next to any system this
@@ -479,6 +490,10 @@ struct vmux_group {
      * rolling trackers above are. */
     uint64_t rtt_sum;
     unsigned rtt_count;
+    /* Also transient: this tick's sum of tx.rate and count of the group's running
+     * data paths, for the paths' selection weights (see vmux_update()). */
+    uint64_t wsum;
+    unsigned wcnt;
     /* Probe-based path health (see "Probe-based path health" below and
      * struct vmux_path's own `probe` member). Populated from whichever of
      * this group's members has conf.monitor set -- at most one is expected
@@ -554,15 +569,31 @@ struct vmux {
     int sock_v4, sock_v6;
     sa_family_t sock_family;
     struct vmux_conf conf;
-    struct vmux_path paths[VMUX_PATH_MAX];
-    struct vmux_group groups[VMUX_PATH_MAX]; /* worst case one group per path
-                                 * (every path its own physical link); a
-                                 * real deployment has only a handful of
-                                 * distinct WAN interfaces, so almost all of
-                                 * this stays !active. See struct vmux_group's
-                                 * own comment. */
+    /* Paths and groups live in chunks that are allocated as they are needed and
+     * never move, so a pointer to one stays valid while the table grows (there
+     * is no fixed limit on the number of paths). Only the arrays of chunk
+     * pointers are ever reallocated, and all of this is guarded by state_lock.
+     * Use vmux_path_at() and vmux_group_at(). */
+    struct vmux_path **path_chunk;
+    unsigned path_chunk_cap;
+    struct vmux_group **group_chunk;
+    unsigned group_chunk_cap;
+    unsigned group_count; /* group slots in use so far */
+    /* Path lookup cache and send-selection index, see vmux_get_path() and
+     * vmux_select_path(). Both guarded by state_lock. */
+    uint32_t *pcache;
+    unsigned pcache_mask, pcache_used;
+    int has_ifpath; /* some path may be bound to a network interface (set where one can appear,
+                     * cleared by vmux_update() when it finds none); while 0, the scan for
+                     * such a path in vmux_get_path() is skipped, which is every packet on a
+                     * server (its paths are all passive) */
+    uint64_t *sel_cum;
+    unsigned *sel_idx;
+    unsigned sel_n, sel_cap;
     unsigned pref;
-    unsigned capacity;
+    unsigned capacity;   /* slots in use so far (highest used index + 1): the bound every scan of the paths uses */
+    unsigned path_limit; /* most paths allowed: VMUX_PATH_UNLIMITED, or the policy's maxpaths */
+    unsigned char idkey[VMUX_KEY_SIZE]; /* derived from the pre-shared key */
     struct vmux_keyx keyx;
     uint64_t last_recv_time;
     size_t mtu;
@@ -604,11 +635,99 @@ struct vmux {
      * server-side per-peer overrides, guarded by state_lock. */
     int borrowed_socks;
     int heap_calloc;
+    int pooled;       /* the struct came from vmux_pool_alloc() */
     struct vmux_policy policy;
 #if defined __APPLE__
     mach_timebase_info_data_t mtid;
 #endif
 };
+
+#define VMUX_PCHUNK_BITS (5U)
+#define VMUX_PCHUNK      (1U << VMUX_PCHUNK_BITS)
+#define VMUX_GCHUNK_BITS (4U)
+#define VMUX_GCHUNK      (1U << VMUX_GCHUNK_BITS)
+/* "No limit": memory is the only one. A policy's maxpaths can still lower it. */
+#define VMUX_PATH_UNLIMITED (0x7FFFFFFFU)
+
+/* The path / group in slot i. Caller holds state_lock and i is below
+ * capacity / group_count, so its chunk exists. */
+static inline struct vmux_path *
+vmux_path_at(const struct vmux *vmux, unsigned i)
+{
+    return &vmux->path_chunk[i >> VMUX_PCHUNK_BITS][i & (VMUX_PCHUNK - 1U)];
+}
+
+static inline struct vmux_group *
+vmux_group_at(const struct vmux *vmux, unsigned i)
+{
+    return &vmux->group_chunk[i >> VMUX_GCHUNK_BITS][i & (VMUX_GCHUNK - 1U)];
+}
+
+/* Makes sure the chunk holding path slot i exists. Returns 0, or -1 with
+ * errno ENOMEM. Caller holds state_lock. */
+static int
+vmux_path_slot_ensure(struct vmux *vmux, unsigned i)
+{
+    const unsigned c = i >> VMUX_PCHUNK_BITS;
+
+    if (c >= vmux->path_chunk_cap) {
+        unsigned cap = vmux->path_chunk_cap ? vmux->path_chunk_cap * 2U : 4U;
+
+        while (cap <= c)
+            cap *= 2U;
+
+        struct vmux_path **n = realloc(vmux->path_chunk, cap * sizeof(*n));
+
+        if (!n) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memset(n + vmux->path_chunk_cap, 0, (cap - vmux->path_chunk_cap) * sizeof(*n));
+        vmux->path_chunk = n;
+        vmux->path_chunk_cap = cap;
+    }
+    if (!vmux->path_chunk[c]) {
+        vmux->path_chunk[c] = calloc(VMUX_PCHUNK, sizeof(struct vmux_path));
+
+        if (!vmux->path_chunk[c]) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+vmux_group_slot_ensure(struct vmux *vmux, unsigned i)
+{
+    const unsigned c = i >> VMUX_GCHUNK_BITS;
+
+    if (c >= vmux->group_chunk_cap) {
+        unsigned cap = vmux->group_chunk_cap ? vmux->group_chunk_cap * 2U : 4U;
+
+        while (cap <= c)
+            cap *= 2U;
+
+        struct vmux_group **n = realloc(vmux->group_chunk, cap * sizeof(*n));
+
+        if (!n) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memset(n + vmux->group_chunk_cap, 0, (cap - vmux->group_chunk_cap) * sizeof(*n));
+        vmux->group_chunk = n;
+        vmux->group_chunk_cap = cap;
+    }
+    if (!vmux->group_chunk[c]) {
+        vmux->group_chunk[c] = calloc(VMUX_GCHUNK, sizeof(struct vmux_group));
+
+        if (!vmux->group_chunk[c]) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    return 0;
+}
 
 static inline int
 vmux_encrypt_opt(const struct vmux_crypto_key *k,
@@ -782,8 +901,31 @@ vmux_select_path(struct vmux *vmux, uint16_t cursor)
 {
     uint64_t k = (cursor * vmux->rate) >> 16;
 
+    /* The prefix sums (rebuilt in vmux_update()) give the same answer as the
+     * walk below: the first sending path whose running total passes k. If the
+     * path it points at has changed state since they were built, or k lies
+     * beyond them, the walk decides. */
+    if (vmux->sel_n && k < vmux->sel_cum[vmux->sel_n - 1]) {
+        unsigned lo = 0, hi = vmux->sel_n - 1;
+
+        while (lo < hi) {
+            const unsigned mid = lo + (hi - lo) / 2U;
+
+            if (vmux->sel_cum[mid] > k)
+                hi = mid;
+            else
+                lo = mid + 1U;
+        }
+        if (vmux->sel_idx[lo] < vmux->capacity) {
+            struct vmux_path *path = vmux_path_at(vmux, vmux->sel_idx[lo]);
+
+            if (path->status == VMUX_RUNNING && !path->conf.monitor &&
+                path->select_weight)
+                return path;
+        }
+    }
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         /* A monitor path (see struct vmux_path_conf's own comment) can
          * legitimately reach VMUX_RUNNING -- it still exchanges ordinary
@@ -981,9 +1123,7 @@ vmux_path_same_group(struct vmux_path *a, struct vmux_path *b)
  * Same grouping rule as vmux_path_same_group() just above, applied against
  * the group's own stored identity rather than another path's live one, so a
  * group outlives any single member path coming or going. Returns NULL only
- * if every one of VMUX_PATH_MAX slots is already a distinct active group --
- * unreachable in practice (that many distinct physical links on one tunnel
- * is not a real deployment), but callers still treat it as "no group
+ * if memory for a new group runs out; callers treat that as "no group
  * tracking for this path right now" rather than assuming success. Always
  * called with state_lock already held, same as vmux_path_same_group()'s own
  * callers. */
@@ -992,8 +1132,8 @@ vmux_group_get(struct vmux *vmux, struct vmux_path *path)
 {
     struct vmux_group *free_slot = NULL;
 
-    for (unsigned i = 0; i < VMUX_PATH_MAX; i++) {
-        struct vmux_group *grp = &vmux->groups[i];
+    for (unsigned i = 0; i < vmux->group_count; i++) {
+        struct vmux_group *grp = vmux_group_at(vmux, i);
 
         if (!grp->active) {
             if (!free_slot)
@@ -1010,7 +1150,9 @@ vmux_group_get(struct vmux *vmux, struct vmux_path *path)
             return grp;
     }
     if (!free_slot) {
-        return NULL;
+        if (vmux_group_slot_ensure(vmux, vmux->group_count))
+            return NULL;
+        free_slot = vmux_group_at(vmux, vmux->group_count++);
     }
 
     free_slot->active = 1;
@@ -1028,12 +1170,12 @@ vmux_get_paths(struct vmux *vmux, struct vmux_paths *paths,
         errno = EINVAL;
         return -1;
     }
-    unsigned count = 0;
+    unsigned count = 0, total = 0;
 
     pthread_mutex_lock(&vmux->state_lock);
 
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (local && local->sa.sa_family &&
             vmux_cmp_addr(local, &path->conf.local))
@@ -1044,12 +1186,19 @@ vmux_get_paths(struct vmux *vmux, struct vmux_paths *paths,
              vmux_cmp_port(remote, &path->conf.remote)))
             continue;
 
-        if (path->conf.state != VMUX_EMPTY)
+        if (path->conf.state == VMUX_EMPTY)
+            continue;
+
+        total++;
+        /* a listing holds at most VMUX_PATH_LIST_MAX paths; total says how many
+         * there really are */
+        if (count < VMUX_PATH_LIST_MAX)
             paths->path[count++] = *path;
     }
     pthread_mutex_unlock(&vmux->state_lock);
 
     paths->count = count;
+    paths->total = total;
     return 0;
 }
 
@@ -1089,6 +1238,145 @@ vmux_policy_apply(struct vmux *vmux, struct vmux_path *path, int reset)
         path->conf.rtt_limit = p->rtt_limit;
 }
 
+/* Path lookup cache. Finding the path a packet belongs to used to scan every
+ * path; now a hash of what identifies it is looked up first. Active paths (with
+ * a local interface) are told apart by interface, socket and remote address and
+ * port; passive/legacy ones by local address and remote address and port. An
+ * entry is only a hint: a hit is checked against the path itself, and a miss or
+ * a stale entry just falls back to the scan (which then refreshes the cache).
+ * The table is open-addressing and rebuilt from the live paths when it passes
+ * half full. All under state_lock. */
+static uint64_t
+vmux_pmix(uint64_t h, const void *data, size_t n)
+{
+    const unsigned char *p = data;
+
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t
+vmux_pkey(unsigned local_ifindex, unsigned sock, union vmux_sockaddr *local,
+         union vmux_sockaddr *remote)
+{
+    uint64_t h = UINT64_C(14695981039346656037);
+    const unsigned char fam = (unsigned char)remote->sa.sa_family;
+
+    h = vmux_pmix(h, &fam, 1);
+
+    if (remote->sa.sa_family == AF_INET) {
+        h = vmux_pmix(h, &remote->sin.sin_addr, sizeof(remote->sin.sin_addr));
+        h = vmux_pmix(h, &remote->sin.sin_port, sizeof(remote->sin.sin_port));
+    } else if (remote->sa.sa_family == AF_INET6) {
+        h = vmux_pmix(h, &remote->sin6.sin6_addr, sizeof(remote->sin6.sin6_addr));
+        h = vmux_pmix(h, &remote->sin6.sin6_port, sizeof(remote->sin6.sin6_port));
+    }
+    if (local_ifindex) {
+        h = vmux_pmix(h, &local_ifindex, sizeof(local_ifindex));
+        h = vmux_pmix(h, &sock, sizeof(sock));
+        h ^= UINT64_C(0x9E3779B97F4A7C15);
+    } else if (local->sa.sa_family == AF_INET) {
+        h = vmux_pmix(h, &local->sin.sin_addr, sizeof(local->sin.sin_addr));
+    } else if (local->sa.sa_family == AF_INET6) {
+        h = vmux_pmix(h, &local->sin6.sin6_addr, sizeof(local->sin6.sin6_addr));
+    }
+    h ^= h >> 29;
+    h *= UINT64_C(0xBF58476D1CE4E5B9);
+    h ^= h >> 32;
+    return h;
+}
+
+static struct vmux_path *
+vmux_pcache_find(struct vmux *vmux, uint64_t key, unsigned local_ifindex,
+                unsigned sock, union vmux_sockaddr *local,
+                union vmux_sockaddr *remote, int legacy)
+{
+    if (!vmux->pcache)
+        return NULL;
+
+    for (unsigned k = (unsigned)key & vmux->pcache_mask; vmux->pcache[k];
+         k = (k + 1U) & vmux->pcache_mask) {
+        const unsigned idx = vmux->pcache[k] - 1U;
+
+        if (idx >= vmux->capacity)
+            continue;
+
+        struct vmux_path *path = vmux_path_at(vmux, idx);
+
+        if (path->conf.state == VMUX_EMPTY)
+            continue;
+
+        if (legacy) {
+            if (path->conf.local_ifindex ||
+                vmux_cmp_addr(local, &path->conf.local))
+                continue;
+        } else if (path->conf.local_ifindex != local_ifindex ||
+                   path->conf.sock != sock) {
+            continue;
+        }
+        if (vmux_cmp_addr(remote, &path->conf.remote) ||
+            vmux_cmp_port(remote, &path->conf.remote))
+            continue;
+
+        return path;
+    }
+    return NULL;
+}
+
+static void
+vmux_pcache_insert(struct vmux *vmux, uint64_t key, unsigned idx)
+{
+    unsigned k = (unsigned)key & vmux->pcache_mask;
+
+    while (vmux->pcache[k]) {
+        if (vmux->pcache[k] == idx + 1U)
+            return;
+        k = (k + 1U) & vmux->pcache_mask;
+    }
+    vmux->pcache[k] = idx + 1U;
+    vmux->pcache_used++;
+}
+
+static void
+vmux_pcache_put(struct vmux *vmux, uint64_t key, unsigned idx)
+{
+    if (!vmux->pcache ||
+        (size_t)(vmux->pcache_used + 1U) * 2U > (size_t)vmux->pcache_mask + 1U) {
+        size_t entries = 64;
+
+        while (entries < ((size_t)vmux->capacity + 1U) * 4U)
+            entries <<= 1;
+
+        uint32_t *n = calloc(entries, sizeof(*n));
+
+        if (!n)
+            return; /* the scan still works without the cache */
+
+        free(vmux->pcache);
+        vmux->pcache = n;
+        vmux->pcache_mask = (unsigned)(entries - 1U);
+        vmux->pcache_used = 0;
+
+        for (unsigned i = 0; i < vmux->capacity; i++) {
+            struct vmux_path *p = vmux_path_at(vmux, i);
+
+            if (p->conf.state == VMUX_EMPTY)
+                continue;
+
+            vmux_pcache_insert(vmux,
+                p->conf.local_ifindex
+                    ? vmux_pkey(p->conf.local_ifindex, p->conf.sock,
+                               &p->conf.local, &p->conf.remote)
+                    : vmux_pkey(0, 0, &p->conf.local, &p->conf.remote),
+                i);
+        }
+    }
+    vmux_pcache_insert(vmux, key, idx);
+}
+
 /* Caller must already hold state_lock -- searches (and, for state >
  * VMUX_DOWN, creates) a path in vmux->paths, which every worker thread and
  * the housekeeping thread can otherwise be touching at the same moment.
@@ -1109,9 +1397,19 @@ vmux_get_path(struct vmux *vmux,
         errno = EINVAL;
         return NULL;
     }
+    const uint64_t key_a = local_ifindex
+                         ? vmux_pkey(local_ifindex, sock, local, remote) : 0;
+    const uint64_t key_b = vmux_pkey(0, 0, local, remote);
+
     if (local_ifindex) {
+        struct vmux_path *hit = vmux_pcache_find(vmux, key_a, local_ifindex,
+                                                sock, local, remote, 0);
+        if (hit)
+            return hit;
+    }
+    if (local_ifindex && vmux->has_ifpath) {
         for (unsigned i = 0; i < vmux->capacity; i++) {
-            struct vmux_path *path = &vmux->paths[i];
+            struct vmux_path *path = vmux_path_at(vmux, i);
 
             if (path->conf.state == VMUX_EMPTY ||
                 path->conf.local_ifindex != local_ifindex ||
@@ -1120,10 +1418,16 @@ vmux_get_path(struct vmux *vmux,
                 vmux_cmp_port(remote, &path->conf.remote))
                 continue;
 
+            vmux_pcache_put(vmux, key_a, i);
             return path;
         }
     }
     if (!local_ifindex || allow_legacy) {
+        struct vmux_path *hit = vmux_pcache_find(vmux, key_b, 0, 0, local, remote, 1);
+
+        if (hit)
+            return hit;
+
         /* Deliberately not matching on `sock` here, unlike the ifindex-
          * based loop above -- on this passive/legacy side, the shared local
          * port means (local address, remote address, remote port) alone
@@ -1143,7 +1447,7 @@ vmux_get_path(struct vmux *vmux,
          * one remote (the server), so only the client's own differing
          * local socket tells them apart there. */
         for (unsigned i = 0; i < vmux->capacity; i++) {
-            struct vmux_path *path = &vmux->paths[i];
+            struct vmux_path *path = vmux_path_at(vmux, i);
 
             if (path->conf.state == VMUX_EMPTY ||
                 path->conf.local_ifindex ||
@@ -1152,6 +1456,7 @@ vmux_get_path(struct vmux *vmux,
                 vmux_cmp_port(remote, &path->conf.remote))
                 continue;
 
+            vmux_pcache_put(vmux, key_b, i);
             return path;
         }
     }
@@ -1160,12 +1465,20 @@ vmux_get_path(struct vmux *vmux,
         return NULL;
     }
     struct vmux_path *path = NULL;
+    unsigned slot_i = 0;
 
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        if (vmux->paths[i].conf.state == VMUX_EMPTY) {
-            path = &vmux->paths[i];
+        if (vmux_path_at(vmux, i)->conf.state == VMUX_EMPTY) {
+            path = vmux_path_at(vmux, i);
+            slot_i = i;
             break;
         }
+    }
+    /* none free: use a new slot, as long as the limit (if any) allows */
+    if (!path && vmux->capacity < vmux->path_limit &&
+        !vmux_path_slot_ensure(vmux, vmux->capacity)) {
+        slot_i = vmux->capacity++;
+        path = vmux_path_at(vmux, slot_i);
     }
     if (!path) {
         errno = ENOMEM;
@@ -1176,8 +1489,16 @@ vmux_get_path(struct vmux *vmux,
     path->conf.local      = *local;
     path->conf.remote     = *remote;
     path->conf.local_ifindex = state == VMUX_PASSIVE ? 0 : local_ifindex;
+    if (path->conf.local_ifindex)
+        vmux->has_ifpath = 1;
     path->conf.sock        = sock;
     path->conf.state      = state;
+    vmux_pcache_put(vmux,
+                   path->conf.local_ifindex
+                       ? vmux_pkey(path->conf.local_ifindex, path->conf.sock,
+                                  &path->conf.local, &path->conf.remote)
+                       : vmux_pkey(0, 0, &path->conf.local, &path->conf.remote),
+                   slot_i);
     path->conf.beat       = 100 * VMUX_ONE_MSEC;
     /* auto-adjusting (not pinned) by default -- an operator who explicitly
      * wants a fixed rate says so with `rate fixed` (see src/path.c), which
@@ -1256,24 +1577,24 @@ vmux_set_policy(struct vmux *vmux, const struct vmux_policy *pol)
     VMUX_ASTORE(&vmux->policy.rx_max_rate, pol->rx_max_rate);
     VMUX_ASTORE(&vmux->policy.set, pol->set);
 
-    unsigned int cap = VMUX_PATH_MAX;
+    unsigned int cap = VMUX_PATH_UNLIMITED;
 
     if (pol->set & VMUX_POLICY_MAXPATHS) {
         cap = pol->max_paths ? pol->max_paths : 1;
-        if (cap > VMUX_PATH_MAX)
-            cap = VMUX_PATH_MAX;
+        if (cap > VMUX_PATH_UNLIMITED)
+            cap = VMUX_PATH_UNLIMITED;
     }
     /* never hide a path that already exists */
     unsigned int top = 0;
 
-    for (unsigned int i = 0; i < VMUX_PATH_MAX; i++) {
-        if (vmux->paths[i].conf.state != VMUX_EMPTY)
+    for (unsigned int i = 0; i < vmux->capacity; i++) {
+        if (vmux_path_at(vmux, i)->conf.state != VMUX_EMPTY)
             top = i + 1;
     }
-    vmux->capacity = (cap < top) ? top : cap;
+    vmux->path_limit = (cap < top) ? top : cap;
 
     for (unsigned int i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (path->conf.state == VMUX_EMPTY)
             continue;
@@ -1383,6 +1704,49 @@ vmux_setup_socket(int fd, int v4, int v6)
         vmux_sso_int(fd, IPPROTO_IP, VMUX_DFRAG, VMUX_DFRAG_OPT);
 #endif
     return 0;
+}
+
+static void
+vmux_id_derive(unsigned char *idkey, const unsigned char *key)
+{
+    static const unsigned char ctx[] = "vortex client id v1";
+
+    crypto_generichash(idkey, VMUX_KEY_SIZE, ctx, sizeof(ctx) - 1,
+                       key, VMUX_KEY_SIZE);
+}
+
+static void
+vmux_id_init(struct vmux *vmux, const unsigned char *key)
+{
+    vmux_id_derive(vmux->idkey, key);
+}
+
+static uint64_t
+vmux_id_window(uint64_t time)
+{
+    return VMUX_TIME_MASK(time) / VMUX_ID_WINDOW;
+}
+
+/* The identifier of a client for one time window, as the 8 bytes sent on the
+ * wire. */
+static void
+vmux_id_compute(const unsigned char *idkey, uint64_t window,
+               unsigned char *out)
+{
+    unsigned char in[8], h[crypto_generichash_BYTES_MIN];
+
+    vmux_store(in, window, sizeof(in));
+    crypto_generichash(h, sizeof(h), in, sizeof(in), idkey, VMUX_KEY_SIZE);
+    memcpy(out, h, VMUX_ID_SIZE);
+}
+
+/* The identifier as a table key; 0 is kept free to mean "empty slot". */
+static uint64_t
+vmux_id_key(const unsigned char *id)
+{
+    const uint64_t k = vmux_load(id, 8);
+
+    return k ? k : 1;
 }
 
 static void
@@ -1540,7 +1904,8 @@ vmux_create(union vmux_sockaddr *addr, unsigned char *key, int *aes)
         sodium_free(vmux);
         return NULL;
     }
-    vmux->capacity = VMUX_PATH_MAX;
+    vmux->capacity = 0;
+    vmux->path_limit = VMUX_PATH_UNLIMITED;
 
     int fd0 = socket(addr->sa.sa_family, SOCK_DGRAM, IPPROTO_UDP);
 
@@ -1691,6 +2056,7 @@ vmux_create(union vmux_sockaddr *addr, unsigned char *key, int *aes)
 
     memcpy(vmux->keyx.private.encrypt.key, key, VMUX_KEY_SIZE);
     memcpy(vmux->keyx.private.decrypt.key, key, VMUX_KEY_SIZE);
+    vmux_id_init(vmux, key);
     sodium_memzero(key, VMUX_KEY_SIZE);
 
     vmux->keyx.current = vmux->keyx.private;
@@ -1777,6 +2143,74 @@ vmux_set_sock_count(struct vmux *vmux, unsigned int count)
     return ret;
 }
 
+/* Memory for hub sessions. A session is a large, mostly empty structure (path
+ * and group tables sized for the worst case) and a hub may hold very many of
+ * them, so they come from page-aligned blocks of fresh anonymous memory: the
+ * kernel only backs the pages a session actually touches, a block of several
+ * sessions costs one mapping rather than one each, and a session that is
+ * freed gives its pages back (MADV_DONTNEED) and is handed out again zeroed. */
+#define VMUX_POOL_BLOCK (32U)
+
+static pthread_mutex_t vmux_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static void **vmux_pool_list;
+static size_t vmux_pool_count, vmux_pool_cap, vmux_pool_total;
+
+static size_t
+vmux_pool_size(void)
+{
+    return (sizeof(struct vmux) + 4095U) & ~(size_t)4095U;
+}
+
+static struct vmux *
+vmux_pool_alloc(void)
+{
+    const size_t size = vmux_pool_size();
+    void *ret = NULL;
+
+    pthread_mutex_lock(&vmux_pool_lock);
+
+    if (!vmux_pool_count) {
+        /* room for every session ever handed out, so a free never has to drop one */
+        if (vmux_pool_cap < vmux_pool_total + VMUX_POOL_BLOCK) {
+            size_t cap = vmux_pool_cap ? vmux_pool_cap * 2U : 4U * VMUX_POOL_BLOCK;
+
+            while (cap < vmux_pool_total + VMUX_POOL_BLOCK)
+                cap *= 2U;
+            void **n = realloc(vmux_pool_list, cap * sizeof(*n));
+
+            if (!n)
+                goto out;
+            vmux_pool_list = n;
+            vmux_pool_cap = cap;
+        }
+        unsigned char *blk = mmap(NULL, size * VMUX_POOL_BLOCK,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (blk == MAP_FAILED)
+            goto out;
+
+        for (unsigned int i = VMUX_POOL_BLOCK; i > 0; i--)
+            vmux_pool_list[vmux_pool_count++] = blk + (size_t)(i - 1U) * size;
+        vmux_pool_total += VMUX_POOL_BLOCK;
+    }
+    ret = vmux_pool_list[--vmux_pool_count];
+out:
+    pthread_mutex_unlock(&vmux_pool_lock);
+    return ret;
+}
+
+static void
+vmux_pool_free(struct vmux *vmux)
+{
+    madvise(vmux, vmux_pool_size(), MADV_DONTNEED);
+
+    pthread_mutex_lock(&vmux_pool_lock);
+    if (vmux_pool_count < vmux_pool_cap)
+        vmux_pool_list[vmux_pool_count++] = vmux;
+    pthread_mutex_unlock(&vmux_pool_lock);
+}
+
 void
 vmux_delete(struct vmux *vmux)
 {
@@ -1789,12 +2223,26 @@ vmux_delete(struct vmux *vmux)
                 close(vmux->sock[i]);
         }
     }
+    free(vmux->reorder.slot);
+    free(vmux->reorder.seq_ring);
+    for (unsigned c = 0; c < vmux->path_chunk_cap; c++)
+        free(vmux->path_chunk[c]);
+    for (unsigned c = 0; c < vmux->group_chunk_cap; c++)
+        free(vmux->group_chunk[c]);
+    free(vmux->path_chunk);
+    free(vmux->group_chunk);
+    free(vmux->pcache);
+    free(vmux->sel_cum);
+    free(vmux->sel_idx);
     pthread_mutex_destroy(&vmux->reorder.flush_lock);
     pthread_mutex_destroy(&vmux->reorder.lock);
     pthread_mutex_destroy(&vmux->keyx_lock);
     pthread_mutex_destroy(&vmux->state_lock);
 
-    if (vmux->heap_calloc) {
+    if (vmux->pooled) {
+        sodium_memzero(&vmux->keyx, sizeof(vmux->keyx));
+        vmux_pool_free(vmux);
+    } else if (vmux->heap_calloc) {
         sodium_memzero(&vmux->keyx, sizeof(vmux->keyx));
         free(vmux);
     } else {
@@ -2068,6 +2516,11 @@ vmux_send_msg(struct vmux *vmux, struct vmux_path *path, uint64_t now,
     unsigned char src[VMUX_PKT_MAX_SIZE] = {0};
     struct vmux_msg *msg = (struct vmux_msg *)src;
 
+    /* `size` is the whole wire size asked for; the client identifier appended
+     * at the end takes VMUX_ID_SIZE of it. */
+    if (size > VMUX_ID_SIZE)
+        size -= VMUX_ID_SIZE;
+
     if (size < VMUX_PKT_MIN_SIZE + sizeof(struct vmux_msg))
         size = VMUX_PKT_MIN_SIZE + sizeof(struct vmux_msg);
 
@@ -2173,6 +2626,9 @@ vmux_send_msg(struct vmux *vmux, struct vmux_path *path, uint64_t now,
         .size = size - VMUX_PKT_MIN_SIZE,
     };
     vmux_encrypt_opt(&vmux->keyx.private, &opt);
+
+    vmux_id_compute(vmux->idkey, vmux_id_window(now), dst + size);
+    size += VMUX_ID_SIZE;
 
     return vmux_send_path(vmux, path, now, dst, size,
                          sent_time ? MSG_CONFIRM : 0);
@@ -2832,9 +3288,17 @@ vmux_recv_finish(struct vmux *vmux, unsigned int sock, struct msghdr *msg,
     }
     pthread_mutex_unlock(&vmux->state_lock);
 
-    size_t ret = VMUX_MSG(sent_time)
-               ? vmux_decrypt_msg(vmux, data, data_cap, packet, (size_t)packet_size)
-               : vmux_decrypt(vmux, data, data_cap, packet, (size_t)packet_size);
+    size_t ret;
+
+    if (VMUX_MSG(sent_time)) {
+        /* the trailing client identifier is for hubs; here it is only removed */
+        ret = ((size_t)packet_size >= VMUX_PKT_MIN_SIZE + VMUX_ID_SIZE)
+            ? vmux_decrypt_msg(vmux, data, data_cap, packet,
+                              (size_t)packet_size - VMUX_ID_SIZE)
+            : 0;
+    } else {
+        ret = vmux_decrypt(vmux, data, data_cap, packet, (size_t)packet_size);
+    }
 
     /* A data packet sent while its sender was stamping ends in a sequence
      * number; take it off so nothing downstream ever sees it. Whether this
@@ -3213,8 +3677,10 @@ vmux_update(struct vmux *vmux)
     if (!vmux_keyx_init(vmux, now))
         now = vmux_now(vmux);
 
+    int ifpath = 0;
+
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (vmux_path_update(vmux, path, now)) {
             if (next_pref > path->conf.pref && path->conf.pref > vmux->pref)
@@ -3228,16 +3694,19 @@ vmux_update(struct vmux *vmux)
             if (!mtu || mtu > path->mtu)
                 mtu = path->mtu;
         }
+        if (path->conf.state != VMUX_EMPTY && path->conf.local_ifindex)
+            ifpath = 1;
         now = vmux_path_track(vmux, path, now);
         count++;
     }
+    vmux->has_ifpath = ifpath;
     if (rate) {
         vmux->pref = pref;
     } else {
         vmux->pref = next_pref;
 
         for (unsigned i = 0; i < vmux->capacity; i++) {
-            struct vmux_path *path = &vmux->paths[i];
+            struct vmux_path *path = vmux_path_at(vmux, i);
 
             if (!vmux_path_update(vmux, path, now))
                 continue;
@@ -3262,34 +3731,79 @@ vmux_update(struct vmux *vmux)
      * path without ever finding a match. */
     uint64_t weighted_rate = 0;
 
+    /* Two passes over the paths instead of every path against every other:
+     * first each group totals the rate and count of its running data paths
+     * (monitor siblings excluded -- their tx.rate never reflects real
+     * throughput), then each path takes its group's average. */
+    for (unsigned g = 0; g < vmux->group_count; g++) {
+        struct vmux_group *grp = vmux_group_at(vmux, g);
+
+        grp->wsum = 0;
+        grp->wcnt = 0;
+    }
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
+
+        if (path->status != VMUX_RUNNING || path->conf.monitor)
+            continue;
+
+        struct vmux_group *grp = vmux_group_get(vmux, path);
+
+        if (!grp)
+            continue;
+
+        grp->wsum += path->tx.rate;
+        grp->wcnt++;
+    }
+    for (unsigned i = 0; i < vmux->capacity; i++) {
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (path->status != VMUX_RUNNING || path->conf.monitor) {
             path->select_weight = 0;
             continue;
         }
-        uint64_t group_total = 0;
-        unsigned group_count = 0;
+        struct vmux_group *grp = vmux_group_get(vmux, path);
 
-        for (unsigned j = 0; j < vmux->capacity; j++) {
-            struct vmux_path *other = &vmux->paths[j];
-
-            /* Excludes monitor siblings too -- their tx.rate never reflects
-             * real throughput (vmux_select_path() never gives them data to
-             * carry), so folding one into this average would understate
-             * the group's real capacity by 1/(N+1) for no reason. */
-            if (other->status != VMUX_RUNNING || other->conf.monitor ||
-                !vmux_path_same_group(path, other))
-                continue;
-
-            group_total += other->tx.rate;
-            group_count++;
-        }
-        path->select_weight = group_count ? group_total / group_count : 0;
+        path->select_weight = (grp && grp->wcnt) ? grp->wsum / grp->wcnt : 0;
         weighted_rate += path->select_weight;
     }
     VMUX_ASTORE(&vmux->rate, weighted_rate); /* read unlocked by a hub's shaper */
+
+    /* Prefix sums of the sending paths' weights, for vmux_select_path(). */
+    if (vmux->sel_cap < vmux->capacity) {
+        const unsigned cap = vmux->capacity + vmux->capacity / 2U + 8U;
+        uint64_t *cum = realloc(vmux->sel_cum, cap * sizeof(*cum));
+
+        if (cum)
+            vmux->sel_cum = cum;
+
+        unsigned *idx = realloc(vmux->sel_idx, cap * sizeof(*idx));
+
+        if (idx)
+            vmux->sel_idx = idx;
+
+        vmux->sel_cap = (cum && idx) ? cap : 0;
+    }
+    vmux->sel_n = 0;
+
+    if (vmux->sel_cap >= vmux->capacity) {
+        uint64_t acc = 0;
+        unsigned n = 0;
+
+        for (unsigned i = 0; i < vmux->capacity; i++) {
+            struct vmux_path *path = vmux_path_at(vmux, i);
+
+            if (path->status != VMUX_RUNNING || path->conf.monitor ||
+                !path->select_weight)
+                continue;
+
+            acc += path->select_weight;
+            vmux->sel_cum[n] = acc;
+            vmux->sel_idx[n] = i;
+            n++;
+        }
+        vmux->sel_n = n;
+    }
 
     /* Group RTT aggregation, and mirroring it (plus probe health) onto
      * every member path -- see struct vmux_group's own comment. This used to
@@ -3299,8 +3813,8 @@ vmux_update(struct vmux *vmux)
      * grp->peer_probe_degraded directly, fed continuously by
      * vmux_probe_recv()/vmux_group_peer_report() rather than by anything
      * computed in this pass. */
-    for (unsigned i = 0; i < VMUX_PATH_MAX; i++) {
-        struct vmux_group *grp = &vmux->groups[i];
+    for (unsigned i = 0; i < vmux->group_count; i++) {
+        struct vmux_group *grp = vmux_group_at(vmux, i);
 
         if (grp->active) {
             grp->rtt_sum = 0;
@@ -3308,7 +3822,7 @@ vmux_update(struct vmux *vmux)
         }
     }
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (path->status != VMUX_RUNNING)
             continue;
@@ -3321,7 +3835,7 @@ vmux_update(struct vmux *vmux)
         grp->rtt_count++;
     }
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (path->conf.state != VMUX_UP && path->conf.state != VMUX_PASSIVE) {
             path->group_rtt = 0;
@@ -3360,13 +3874,13 @@ vmux_update(struct vmux *vmux)
     uint64_t max_running_rtt = 0;
 
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         if (path->status == VMUX_RUNNING && path->rtt.val > max_running_rtt)
             max_running_rtt = path->rtt.val;
     }
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *path = &vmux->paths[i];
+        struct vmux_path *path = vmux_path_at(vmux, i);
 
         uint64_t hold = (path->status == VMUX_RUNNING &&
                          max_running_rtt > path->rtt.val)
@@ -3442,6 +3956,8 @@ vmux_set_path(struct vmux *vmux, struct vmux_path_conf *conf)
     if (conf->probe_recover)  c.probe_recover  = conf->probe_recover * VMUX_ONE_MSEC;
 
     path->conf = c;
+    if (c.local_ifindex)
+        vmux->has_ifpath = 1;
 
     /* No discovery to wait on: apply immediately, every call -- cheap and
      * idempotent, and covers both a newly configured value and a brand
@@ -3468,7 +3984,7 @@ vmux_rebind_path(struct vmux *vmux, unsigned int old_ifindex,
     struct vmux_path *path = NULL;
 
     for (unsigned i = 0; i < vmux->capacity; i++) {
-        struct vmux_path *candidate = &vmux->paths[i];
+        struct vmux_path *candidate = vmux_path_at(vmux, i);
 
         if (candidate->conf.state == VMUX_EMPTY ||
             candidate->conf.local_ifindex != old_ifindex ||
@@ -3491,6 +4007,8 @@ vmux_rebind_path(struct vmux *vmux, unsigned int old_ifindex,
 
     memset(path, 0, sizeof(*path));
     path->conf = conf;
+    if (conf.local_ifindex)
+        vmux->has_ifpath = 1;
     path->status = VMUX_PROBING;
     path->idle = vmux_now(vmux);
     /* 0 == uncapped, not "rate 0" -- see vmux_get_path()'s own comment.
@@ -3951,6 +4469,15 @@ vmux_reorder_insert(struct vmux *vmux, uint64_t hold, uint64_t now,
         pthread_mutex_unlock(&ro->lock);
         return 0;
     }
+
+    if (!ro->slot) {
+        ro->slot = calloc(VMUX_REORDER_MAX, sizeof(*ro->slot));
+
+        if (!ro->slot) {
+            pthread_mutex_unlock(&ro->lock);
+            return 0;
+        }
+    }
     struct vmux_reorder_slot *s = &ro->slot[ro->count++];
 
     memcpy(s->data, data, size);
@@ -3999,6 +4526,14 @@ vmux_seq_insert(struct vmux *vmux, uint32_t seq, uint64_t hold, uint64_t now,
 
     pthread_mutex_lock(&ro->lock);
 
+    if (!ro->seq_ring) {
+        ro->seq_ring = calloc(VMUX_SEQ_RING_SIZE, sizeof(*ro->seq_ring));
+
+        if (!ro->seq_ring) {
+            pthread_mutex_unlock(&ro->lock);
+            return 0;
+        }
+    }
     int32_t dist = (int32_t)(seq - ro->seq_next);
 
     if (!ro->seq_sync || dist > VMUX_SEQ_RESYNC || dist < -VMUX_SEQ_RESYNC) {
@@ -4013,7 +4548,7 @@ vmux_seq_insert(struct vmux *vmux, uint32_t seq, uint64_t hold, uint64_t now,
          * the ring on every resync -- itself a rare event, so paying
          * VMUX_SEQ_RING_SIZE here costs nothing that matters -- avoids that
          * instead of waiting it out. */
-        memset(ro->seq_ring, 0, sizeof(ro->seq_ring));
+        memset(ro->seq_ring, 0, VMUX_SEQ_RING_SIZE * sizeof(*ro->seq_ring));
         ro->seq_count = 0;
         ro->seq_next_deadline = 0;
         ro->seq_next = seq;

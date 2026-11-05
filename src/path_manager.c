@@ -224,9 +224,16 @@ vx_path_manager_set(struct vx_path_manager *manager, struct vmux *vmux,
             errno = ENOENT;
             return -1;
         }
-        if (manager->count == VMUX_PATH_MAX) {
-            errno = ENOSPC;
-            return -1;
+        if (manager->count == manager->cap) {
+            const unsigned int cap = manager->cap ? manager->cap * 2U : 64U;
+            struct vx_managed_path *n = realloc(manager->path, cap * sizeof(*n));
+
+            if (!n) {
+                errno = ENOMEM;
+                return -1;
+            }
+            manager->path = n;
+            manager->cap = cap;
         }
         path = &manager->path[manager->count++];
         memset(path, 0, sizeof(*path));

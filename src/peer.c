@@ -187,7 +187,7 @@ vx_peer_parse(int argc, char **argv, int set, struct ctl_peer *out,
     struct argz_ull pref = {.max = 0x7F};
     struct argz_ull loss = {.max = 100, .suffix = vx_argz_percent_suffix};
     struct argz_ull rtt = {.suffix = argz_time_suffix};
-    struct argz_ull maxpaths = {.min = 1, .max = VMUX_PATH_MAX};
+    struct argz_ull maxpaths = {.min = 1, .max = 0x7FFFFFFF};
     struct argz_ull kx = {.suffix = argz_time_suffix};
     struct argz_ull tt = {.suffix = argz_time_suffix};
     struct argz_ull ka = {.suffix = argz_time_suffix};

@@ -576,6 +576,7 @@ vx_bind(int argc, char **argv, void *data)
                         unsigned int count = vx_path_manager_status(
                             &path_manager, vmux, req.ifname,
                             &req.path.conf.remote, managed, VMUX_PATH_MAX);
+                        res.connections = path_manager.count;
                         for (unsigned int i = 0; i < count; i++) {
                             res.path = managed[i].path;
                             memcpy(res.ifname, managed[i].ifname,
@@ -594,6 +595,9 @@ vx_bind(int argc, char **argv, void *data)
                             res.ret = errno;
                             break;
                         }
+                        /* the whole number, the listing may hold fewer */
+                        if (paths.total > res.connections)
+                            res.connections = paths.total;
                         memset(res.ifname, 0, sizeof(res.ifname));
                         res.ifindex = 0;
                         res.path_availability = VX_PATH_AVAILABLE;
