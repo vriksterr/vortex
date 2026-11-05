@@ -1310,6 +1310,10 @@ vmux_get_errors(struct vmux *vmux, struct vmux_errors *err)
 int
 vmux_set(struct vmux *vmux, struct vmux_conf *conf)
 {
+    if (conf->tx_batch > VMUX_TX_BATCH_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
     pthread_mutex_lock(&vmux->state_lock);
 
     struct vmux_conf c = vmux->conf;
@@ -1326,6 +1330,8 @@ vmux_set(struct vmux *vmux, struct vmux_conf *conf)
     /* request: 0 = not given, 1 = off, 2 = on (see vmux_conf.strict_order);
      * stored and returned as 0/1 */
     if (conf->strict_order) c.strict_order = conf->strict_order == 2;
+    /* 0 = not given; 1..VMUX_TX_BATCH_MAX checked above */
+    if (conf->tx_batch) c.tx_batch = conf->tx_batch;
 
     /* reorder_window is read without the lock on the packet path (see
      * vmux_reorder_insert()), so it is stored atomically */
@@ -1334,6 +1340,8 @@ vmux_set(struct vmux *vmux, struct vmux_conf *conf)
     vmux->conf.kxtimeout     = c.kxtimeout;
     VMUX_ASTORE(&vmux->conf.reorder_window, c.reorder_window);
     VMUX_ASTORE(&vmux->conf.strict_order, c.strict_order);
+    /* read without the lock by every worker on each TX wakeup */
+    VMUX_ASTORE(&vmux->conf.tx_batch, c.tx_batch);
     pthread_mutex_unlock(&vmux->state_lock);
 
     *conf = c;
@@ -1669,6 +1677,7 @@ vmux_create(union vmux_sockaddr *addr, unsigned char *key, int *aes)
     vmux->conf.timetolerance = 10 * VMUX_ONE_MIN;
     vmux->conf.kxtimeout     = 60 * VMUX_ONE_MIN;
     vmux->conf.strict_order  = 1;
+    vmux->conf.tx_batch      = VMUX_TX_BATCH_DEFAULT;
 
 #if defined __APPLE__
     mach_timebase_info(&vmux->mtid);
@@ -3629,6 +3638,19 @@ vmux_worker_count(void)
  * load rather than one that recurs per packet. */
 #define VMUX_BATCH_MAX (16U)
 
+/* The TX batch actually used for a configured value: 0 (never set) gives the
+ * default, and anything out of range is clamped, so a stray value can never
+ * overrun the per-worker slot arrays. */
+static unsigned int
+vmux_tx_limit(uint64_t configured)
+{
+    if (!configured)
+        return VMUX_TX_BATCH_DEFAULT;
+    if (configured > VMUX_TX_BATCH_MAX)
+        return VMUX_TX_BATCH_MAX;
+    return (unsigned int)configured;
+}
+
 struct vmux_rx_slot {
     union vmux_sockaddr remote;
     unsigned char ctrl[VMUX_CTRL_SIZE];
@@ -3661,7 +3683,7 @@ struct vmux_tx_slot {
  * whole lifetime. */
 struct vmux_worker_scratch {
     struct vmux_rx_slot rx[VMUX_BATCH_MAX];
-    struct vmux_tx_slot tx[VMUX_BATCH_MAX];
+    struct vmux_tx_slot tx[VMUX_TX_BATCH_MAX];
 };
 
 /* Drains up to `max` already-queued datagrams off one ready, non-blocking
@@ -3728,14 +3750,14 @@ vmux_recv_batch(int fd, struct vmux_rx_slot *slots, unsigned int max)
 /* Sends `n` already-encrypted TX slots, grouping by destination socket (a
  * batch can span more than one physical path/sub-flow) -- one sendmmsg()
  * per distinct sock on Linux, a plain per-message sendmsg() loop elsewhere.
- * `n` is bounded by VMUX_BATCH_MAX, so the O(n^2) grouping scan is cheap.
+ * `n` is bounded by VMUX_TX_BATCH_MAX, so the O(n^2) grouping scan is cheap.
  * Stats/window bookkeeping matches vmux_send_path()'s, just applied once per
  * slot actually confirmed sent instead of once per syscall. */
 static void
 vmux_send_batch(struct vmux *vmux, struct vmux_tx_slot *tx, unsigned int n,
               uint64_t now)
 {
-    unsigned char done[VMUX_BATCH_MAX] = {0};
+    unsigned char done[VMUX_TX_BATCH_MAX] = {0};
 
     /* Slots with no selected path (vmux_select_path() found nothing running)
      * have uninitialized sock/local/remote -- never read those fields,
@@ -3750,7 +3772,7 @@ vmux_send_batch(struct vmux *vmux, struct vmux_tx_slot *tx, unsigned int n,
             continue;
 
         const uint16_t sock = tx[g].sock;
-        unsigned int members[VMUX_BATCH_MAX];
+        unsigned int members[VMUX_TX_BATCH_MAX];
         unsigned int member_count = 0;
 
         for (unsigned int j = g; j < n; j++) {
@@ -3758,9 +3780,9 @@ vmux_send_batch(struct vmux *vmux, struct vmux_tx_slot *tx, unsigned int n,
                 members[member_count++] = j;
         }
 #if defined __linux__
-        struct mmsghdr mmsg[VMUX_BATCH_MAX];
-        struct iovec iov[VMUX_BATCH_MAX];
-        unsigned char ctrl[VMUX_BATCH_MAX][VMUX_CTRL_SIZE];
+        struct mmsghdr mmsg[VMUX_TX_BATCH_MAX];
+        struct iovec iov[VMUX_TX_BATCH_MAX];
+        unsigned char ctrl[VMUX_TX_BATCH_MAX][VMUX_CTRL_SIZE];
 
         for (unsigned int m = 0; m < member_count; m++) {
             struct vmux_tx_slot *s = &tx[members[m]];
@@ -4436,7 +4458,9 @@ vmux_worker_loop(struct vmux *vmux, unsigned int worker_index,
 
                 const int tun_fd = tun_fds[qi];
                 unsigned int tx_n = 0, tx_attempts = 0;
-                uint16_t tx_key[VMUX_BATCH_MAX];
+                uint16_t tx_key[VMUX_TX_BATCH_MAX];
+                const unsigned int tx_limit =
+                    vmux_tx_limit(VMUX_ALOAD(&vmux->conf.tx_batch));
 
                 /* Pass 1: drain this queue and encrypt, with no locking at
                  * all -- vmux_encrypt() takes only the much less contended
@@ -4453,7 +4477,7 @@ vmux_worker_loop(struct vmux *vmux, unsigned int worker_index,
                  * One lock covering the whole batch's selection (pass 2)
                  * bounds that to one acquisition per thread per wakeup,
                  * same as before batching existed. */
-                while (tx_n < VMUX_BATCH_MAX && tx_attempts < VMUX_BATCH_MAX) {
+                while (tx_n < tx_limit && tx_attempts < tx_limit) {
                     tx_attempts++;
 
                     const int r = tun_read(tun_fd, plain, sizeof(plain));

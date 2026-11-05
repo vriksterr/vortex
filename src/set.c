@@ -12,6 +12,7 @@ vx_set(int argc, char **argv, void *data)
     struct argz_ull ka = {.suffix = argz_time_suffix};
     struct argz_ull rw = {.suffix = argz_time_suffix};
     int strict = 0;
+    struct argz_ull tb = {.min = 1, .max = VMUX_TX_BATCH_MAX};
 
     struct argz z[] = {
         {"dev",           "Tunnel device",       vx_argz_dev, &dev},
@@ -25,12 +26,20 @@ vx_set(int argc, char **argv, void *data)
         {"strictorder",   "Number packets (TCP too) and release them in "
                           "order: on|off (default on)",
                                                      vx_argz_onoff, &strict},
+        {"txbatch",       "Most packets sent in one burst, 1-128 "
+                          "(default 16; smaller = shorter bursts)",
+                                                     argz_ull,  &tb},
         {0}};
 
     int err = argz(argc, argv, z);
 
     if (err)
         return err;
+
+    if (peer && argz_is_set(z, "txbatch")) {
+        vx_log("txbatch applies to the whole tunnel; set it without peer\n");
+        return -1;
+    }
 
     struct ctl_msg req = {
         .type = CTL_CONF,
@@ -52,6 +61,8 @@ vx_set(int argc, char **argv, void *data)
                              ? ((rw.value * UINT64_C(1000)) << 1) | 1
                              : 0,
             .strict_order = (uint64_t)strict,
+            /* 0 = not given; the parser already limits it to 1-128 */
+            .tx_batch = argz_is_set(z, "txbatch") ? tb.value : 0,
         },
     }, res = {0};
 
@@ -79,9 +90,10 @@ vx_set(int argc, char **argv, void *data)
         vx_totime(t3, sizeof(t3), res.conf.reorder_window / 1000);
 
         printf("set dev %s kxtimeout %s timetolerance %s keepalive %s "
-               "reorderwindow %s strictorder %s\n",
+               "reorderwindow %s strictorder %s txbatch %llu\n",
                 res.tun_name, t0, t1, t2, t3,
-                res.conf.strict_order ? "on" : "off");
+                res.conf.strict_order ? "on" : "off",
+                (unsigned long long)res.conf.tx_batch);
         if (strict == 2 && !res.conf.reorder_window)
             vx_log("note: strictorder is on but reorderwindow is 0, so "
                    "nothing is reordered; set reorderwindow (for example "

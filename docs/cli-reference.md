@@ -124,6 +124,7 @@ vortex set [dev NAME]
   [keepalive DURATION]
   [reorderwindow DURATION]
   [strictorder on|off]
+  [txbatch NUMBER]
 ```
 
 Durations accept the suffixes understood by the bundled argument parser, such
@@ -141,11 +142,23 @@ a successful update.
   number order. `off` uses only the older round-trip-time hold. It has an
   effect only while `reorderwindow` is set, and the setting is per receiving
   side.
+* `txbatch` is the most packets a worker takes from the tunnel device and
+  sends in one go, from `1` to `128` (default `16`). Each packet is still
+  encrypted and given a path on its own; the batch only decides how many
+  leave the machine back to back. A smaller value gives shorter bursts on the
+  wire, which can mean fewer drops on a link with a shallow buffer, at the cost
+  of more system calls and CPU (`1` is clearly slower on a small machine; `4`
+  is a reasonable first value to try). A larger value is cheaper on CPU but
+  burstier. It changes only what this end sends and is not sent to the peer,
+  so the two ends may differ, but each end controls its own direction. It
+  takes effect at once, without a restart. On a multi-client hub it is one
+  value for the whole hub, so give it without `peer`.
 
 Example:
 
 ```sh
 vortex set dev vx0 kxtimeout 1h timetolerance 10m keepalive 10s
+vortex set dev vx0 txbatch 4
 ```
 
 Use relaxed clock tolerance only as a temporary diagnostic measure; fixing

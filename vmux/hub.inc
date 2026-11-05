@@ -554,6 +554,7 @@ vmux_hub_create(union vmux_sockaddr *addr, int *aes)
     hub->defaults.timetolerance = 10 * VMUX_ONE_MIN;
     hub->defaults.kxtimeout     = 60 * VMUX_ONE_MIN;
     hub->defaults.strict_order  = 1;
+    hub->defaults.tx_batch      = VMUX_TX_BATCH_DEFAULT;
 
     if (*aes && !aegis256_is_available())
         *aes = 0;
@@ -833,6 +834,11 @@ vmux_hub_set_defaults(struct vmux_hub *hub, struct vmux_conf *conf)
         hub->defaults.reorder_window = conf->reorder_window >> 1;
     if (conf->strict_order)
         hub->defaults.strict_order = conf->strict_order == 2;
+    /* one value for the whole hub: its workers read it on every TX wakeup */
+    if (conf->tx_batch)
+        VMUX_ASTORE(&hub->defaults.tx_batch,
+                    conf->tx_batch > VMUX_TX_BATCH_MAX ? VMUX_TX_BATCH_MAX
+                                                       : conf->tx_batch);
     *conf = hub->defaults;
     pthread_mutex_unlock(&hub->admin_lock);
 }
@@ -1136,10 +1142,12 @@ vmux_hub_drain(struct vmux_hub *hub, struct vmux_worker_scratch *sc,
         struct vmux *pm = __atomic_load_n(&hp->vmux, __ATOMIC_ACQUIRE);
         struct vmux_hub_q *q = hp->q;
         unsigned int tx_n = 0;
-        uint16_t key[VMUX_BATCH_MAX];
+        uint16_t key[VMUX_TX_BATCH_MAX];
+        const unsigned int tx_limit =
+            vmux_tx_limit(VMUX_ALOAD(&hub->defaults.tx_batch));
 
         if (q && q->count) {
-            while (q->count && tx_n < VMUX_BATCH_MAX) {
+            while (q->count && tx_n < tx_limit) {
                 const size_t len = q->len[q->head];
 
                 if (!vmux_hub_take(pm, len + VMUX_PKT_MIN_SIZE))
@@ -1285,9 +1293,11 @@ vmux_hub_worker_loop(struct vmux_hub *hub, unsigned int worker_index,
 
                 const int tun_fd = tun_fds[qi];
                 unsigned int tx_n = 0, tx_attempts = 0;
-                uint16_t tx_key[VMUX_BATCH_MAX];
+                uint16_t tx_key[VMUX_TX_BATCH_MAX];
+                const unsigned int tx_limit =
+                    vmux_tx_limit(VMUX_ALOAD(&hub->defaults.tx_batch));
 
-                while (tx_n < VMUX_BATCH_MAX && tx_attempts < VMUX_BATCH_MAX) {
+                while (tx_n < tx_limit && tx_attempts < tx_limit) {
                     tx_attempts++;
 
                     const int r = tun_read(tun_fd, plain, sizeof(plain));

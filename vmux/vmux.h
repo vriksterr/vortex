@@ -84,6 +84,12 @@
  * backstop, not a competing decision. */
 #define VMUX_MTU_HARD_MAX (65535U)
 
+/* How many packets a worker takes from the tunnel device and sends in one go
+ * (vmux_conf.tx_batch). The buffers for the largest batch are allocated per
+ * worker, so this is also the hard limit the CLI enforces. */
+#define VMUX_TX_BATCH_MAX     (128U)
+#define VMUX_TX_BATCH_DEFAULT (16U)
+
 struct vmux;
 
 enum vmux_state {
@@ -163,6 +169,17 @@ struct vmux_conf {
      * reason reorder_window carries a marker bit); what vmux_set() stores and
      * hands back is a plain 0 (off) or 1 (on). Defaults to on. */
     uint64_t strict_order;
+    /* Most packets a worker reads from the tunnel device before it sends
+     * them (encrypting each one, picking a path for each, then one sendmmsg
+     * per socket). A smaller batch means shorter bursts on the wire, which
+     * helps where a link has a shallow buffer, at the cost of more system
+     * calls; a larger one is cheaper on CPU but burstier. 0 in a request
+     * means "not given"; valid values are 1..VMUX_TX_BATCH_MAX (anything
+     * larger is rejected by vmux_set()). Defaults to
+     * VMUX_TX_BATCH_DEFAULT. Only affects what this end sends; it is not
+     * sent to the peer. In a multi-client hub it is one value for the whole
+     * hub (set without `peer`). Takes effect immediately. */
+    uint64_t tx_batch;
 };
 
 union vmux_sockaddr {

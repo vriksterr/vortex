@@ -126,6 +126,14 @@ protocol, so they're safe to deploy on one end of a tunnel at a time.
    See `docs/cli-reference.md` and "Packet resequencing" in
    `docs/architecture.md`.
 
+ * **Adjustable send bursts (`txbatch`)**
+
+   Each worker reads up to 16 packets from the tunnel device and sends them
+   back to back. `set ... txbatch N` (1-128, default 16) changes that; a
+   smaller value gives shorter bursts, which can mean fewer drops on a link
+   with a shallow buffer, at the cost of more CPU. It only affects what this
+   end sends and takes effect at once. See `docs/cli-reference.md`.
+
 ## Multi-client servers
 
 One server can serve many clients on a single port, each with its own key, rate
