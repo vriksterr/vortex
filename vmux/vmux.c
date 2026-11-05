@@ -463,8 +463,8 @@ struct vmux_reorder {
 
 /* Pooled RTT/probe-health state for every path sharing one physical link --
  * see struct vmux_path's group_rtt field (vmux.h) for the full rationale.
- * Identity fields mirror vmux_path_same_group()'s own comparison exactly
- * (see vmux_group_get()), snapshotted once when the group is first created
+ * Identity fields mirror the grouping rule in vmux_group_get() exactly,
+ * snapshotted once when the group is first created
  * rather than read live off some "representative" member path -- so the
  * group's identity survives regardless of which specific member paths come
  * and go over the tunnel's lifetime. Found/created via linear scan
@@ -1097,36 +1097,24 @@ vmux_cmp_port(union vmux_sockaddr *a, union vmux_sockaddr *b)
     return 1;
 }
 
-/* Two paths are sub-flows of the same physical link if they share local
- * identity (interface index, or local address for legacy/passive paths
- * where local_ifindex is always 0) and remote *address* -- deliberately not
- * remote port. One side of a sub-flow group varies by local port (distinct
- * vmux->sock[] entries, same remote address:port); the other side -- the
- * passive peer, which never opens extra sockets -- instead sees the same
- * local address with N distinct remote ports, one per sub-flow it auto-
- * discovered. Comparing remote address only (never remote port) groups
- * correctly from either side without needing to know which one it is. */
-static int
-vmux_path_same_group(struct vmux_path *a, struct vmux_path *b)
-{
-    if (a->conf.local_ifindex || b->conf.local_ifindex) {
-        if (a->conf.local_ifindex != b->conf.local_ifindex)
-            return 0;
-    } else if (vmux_cmp_addr(&a->conf.local, &b->conf.local)) {
-        return 0;
-    }
-    return !vmux_cmp_addr(&a->conf.remote, &b->conf.remote);
-}
-
 /* Finds this path's struct vmux_group (see its own comment), creating one in
  * the first free slot if this is the first path seen with this identity.
- * Same grouping rule as vmux_path_same_group() just above, applied against
- * the group's own stored identity rather than another path's live one, so a
- * group outlives any single member path coming or going. Returns NULL only
- * if memory for a new group runs out; callers treat that as "no group
- * tracking for this path right now" rather than assuming success. Always
- * called with state_lock already held, same as vmux_path_same_group()'s own
- * callers. */
+ *
+ * Two paths are sub-flows of the same physical link, and so share a group, if
+ * they share local identity (interface index, or local address for legacy/
+ * passive paths where local_ifindex is always 0) and remote *address* --
+ * deliberately not remote port. One side of a sub-flow group varies by local
+ * port (distinct vmux->sock[] entries, same remote address:port); the other
+ * side -- the passive peer, which never opens extra sockets -- instead sees the
+ * same local address with N distinct remote ports, one per sub-flow it auto-
+ * discovered. Comparing remote address only (never remote port) groups
+ * correctly from either side without needing to know which one it is. The rule
+ * is applied against the group's own stored identity rather than another
+ * path's live one, so a group outlives any single member path coming or going.
+ *
+ * Returns NULL only if memory for a new group runs out; callers treat that as
+ * "no group tracking for this path right now" rather than assuming success.
+ * Always called with state_lock already held. */
 static struct vmux_group *
 vmux_group_get(struct vmux *vmux, struct vmux_path *path)
 {
@@ -3720,7 +3708,7 @@ vmux_update(struct vmux *vmux)
     /* Recompute vmux->rate from select_weight rather than the raw tx.rate
      * sum above -- rate was only needed to settle vmux->pref just now. Every
      * RUNNING path's selection weight becomes its physical-link group's
-     * average tx.rate (see vmux_path_same_group()), so vmux_select_path()'s
+     * average tx.rate (see vmux_group_get()), so vmux_select_path()'s
      * weighted walk splits packets evenly across sub-flows of one link
      * regardless of which currently measures fastest, while still favoring
      * whichever physical link has more real aggregate capacity. Recomputing

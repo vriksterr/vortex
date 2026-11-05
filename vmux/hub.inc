@@ -1243,16 +1243,24 @@ vmux_hub_peer_add(struct vmux_hub *hub, const char *name,
         err = ENOMEM;
         goto out;
     }
+    const int fresh = !slot;
+
     if (slot) {
         /* A removed client coming back: its old session is already parked
          * for removal; the old route snapshot is parked now. */
         vmux_hub_retire(hub, slot->routes, VMUX_RETIRE_FREE, NULL);
     } else if (hub->free_count) {
         slot = vmux_hub_peer_at(hub, hub->free_slots[--hub->free_count]);
-        memcpy(slot->name, name, strlen(name) + 1);
-        slot->used = 1;
     } else {
         slot = vmux_hub_peer_at(hub, new_index);
+    }
+    if (!slot) { /* cannot happen: the room was made above */
+        free(routes);
+        vmux_delete(vmux);
+        err = ENOMEM;
+        goto out;
+    }
+    if (fresh) {
         memcpy(slot->name, name, strlen(name) + 1);
         slot->used = 1;
     }
