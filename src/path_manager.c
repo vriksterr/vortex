@@ -143,6 +143,51 @@ vx_path_manager_suspend(struct vx_managed_path *path, struct vmux *vmux)
     return 0;
 }
 
+/* Keeps the sub-flow's own socket bound to its interface. A bound socket's
+ * packets always leave through that interface: the kernel does its route
+ * lookup with the interface fixed, and again after firewall marks change (the
+ * `mwan3` / policy-routing case, where it otherwise re-routes a packet marked
+ * "use the main table" out of the default route's interface). Without this a
+ * route, rule or mark that covers the server's address can move one ISP's
+ * packets onto another.
+ *
+ * The binding is by interface index inside the kernel, so it is redone
+ * whenever the index changes (an interface that was removed and recreated,
+ * like a PPPoE link, comes back with a new one). An interface that is gone
+ * keeps the old binding, which just sends nothing until it returns. Failure
+ * (no CAP_NET_RAW on an old kernel) is reported once and the path carries on
+ * unbound, as before. */
+static void
+vx_path_manager_bind_dev(struct vx_managed_path *path, struct vmux *vmux)
+{
+    const int fd = vmux_get_fd(vmux, path->sock);
+
+    if (fd < 0)
+        return;
+
+    if (!path->bind_dev) {
+        if (path->so_ifindex &&
+            !setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, "", 0))
+            path->so_ifindex = 0;
+        return;
+    }
+    if (!path->ifindex || path->ifindex == path->so_ifindex)
+        return;
+
+#ifdef SO_BINDTODEVICE
+    if (!setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, path->ifname,
+                    (socklen_t)strlen(path->ifname) + 1)) {
+        path->so_ifindex = path->ifindex;
+        return;
+    }
+    if (!path->bind_warned) {
+        path->bind_warned = 1;
+        vx_log("cannot bind a sub-flow to %s (%s): it follows the routing "
+               "table\n", path->ifname, strerror(errno));
+    }
+#endif
+}
+
 static int
 vx_path_manager_reconcile_one(struct vx_managed_path *path, struct vmux *vmux)
 {
@@ -161,6 +206,8 @@ vx_path_manager_reconcile_one(struct vx_managed_path *path, struct vmux *vmux)
     path->link_up = info.link_up;
     path->address_ready = info.address_ready;
     path->current_local = info.local;
+
+    vx_path_manager_bind_dev(path, vmux);
 
     if (!path->desired_up || !path->link_up || !path->address_ready)
         return vx_path_manager_suspend(path, vmux);
@@ -255,7 +302,10 @@ vx_path_manager_set(struct vx_path_manager *manager, struct vmux *vmux,
          * default on every single path this manager ever touched. */
         path->desired_conf.fixed_rate = 0;
         path->desired_conf.loss_limit = 255;
+        path->bind_dev = 1;
     }
+    if (manager->req_bind)
+        path->bind_dev = manager->req_bind == 2;
     vx_path_manager_update_conf(path, conf);
     if (vx_path_manager_reconcile_one(path, vmux))
         return -1;

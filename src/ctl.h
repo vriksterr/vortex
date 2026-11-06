@@ -50,6 +50,8 @@ struct ctl_msg {
     int path_availability;
     unsigned int connections; /* requested sub-flow count for CTL_PATH_CONF;
                                 * 0 = unspecified/unchanged, 1 = default */
+    int bind_dev;             /* CTL_PATH_CONF: 0 = unchanged, 1 = off, 2 = on: bind
+                               * each sub-flow socket to its interface */
     char peer[VMUX_HUB_NAME_MAX]; /* selects one client of a hub tunnel for
                                    * path/show/set requests; empty = all */
     union {

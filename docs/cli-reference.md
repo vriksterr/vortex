@@ -260,6 +260,7 @@ vortex path up|down [LOCAL_IP] [SELECTOR]
   [beat DURATION]
   [pref NUMBER]
   [connections NUMBER]
+  [bind on|off]
   [losslimit PERCENT%]
   [rttlimit DURATION]
   [mtu SIZE]
@@ -316,6 +317,20 @@ Important units and behavior:
   The peer needs no configuration -- each sub-flow is a normal UDP flow from a
   distinct source port, and the passive side already auto-creates one path
   per distinct source port it observes.
+
+* `bind` (default `on`; requires `via INTERFACE`) binds each sub-flow's socket
+  to its interface (`SO_BINDTODEVICE`), so the tunnel's own packets always
+  leave through that interface, whatever the routing table, policy rules or
+  firewall marks say. Without it a route, rule or mark that covers the
+  server's address (multi-WAN tools such as mwan3 add some) can send one ISP's
+  packets out another: the path shows 100% loss and the other ISP carries its
+  traffic. The binding follows the interface: it is redone when the interface
+  is removed and comes back with a new index (a PPPoE reconnect). Routing must
+  still work on that interface, because a bound socket only picks the
+  interface, not the route. If the binding is refused (an old kernel without
+  `CAP_NET_RAW`), vortex logs it once and the path works as before. Only the
+  tunnel's own packets are affected; the traffic inside the tunnel follows your
+  routes as usual. `bind off` goes back to using the routing table.
 
 When changing one path in a multipath tunnel, provide enough of the selector to
 identify it unambiguously.

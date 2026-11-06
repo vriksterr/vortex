@@ -613,6 +613,7 @@ vx_bind(int argc, char **argv, void *data)
                     res.ret = 0;
                     break;
                 case CTL_PATH_CONF: {
+                    path_manager.req_bind = req.bind_dev;
                     if (req.path.conf.remote.sa.sa_family) {
                         if (!vx_get_port(&req.path.conf.remote))
                             vx_set_port(&req.path.conf.remote,

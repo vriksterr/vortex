@@ -32,11 +32,20 @@ struct vx_managed_path {
     int runtime_bound;
     int runtime_active;
     int config_dirty;
+    int bind_dev;            /* 0 = off, 1 = on (default): the sub-flow's socket
+                              * is bound to the interface (SO_BINDTODEVICE), so
+                              * no route, rule or firewall mark can send its
+                              * packets out another one */
+    unsigned int so_ifindex; /* ifindex the socket is currently bound to (0 =
+                              * not bound) */
+    int bind_warned;
 };
 
 struct vx_path_manager {
     struct vx_managed_path *path; /* grows as sub-flows are added: no fixed limit */
     unsigned int count, cap;
+    int req_bind;                 /* what the request being handled asked for:
+                                   * 0 = unchanged, 1 = off, 2 = on */
 };
 
 struct vx_managed_status {

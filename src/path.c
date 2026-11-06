@@ -513,6 +513,7 @@ vx_path(int argc, char **argv, void *data)
     struct vx_argz_addr remote = {0};
     const char *peer = NULL;
     const char *dev = NULL;
+    int bind_dev = 0;
     char ifname[IFNAMSIZ] = {0};
 
     struct argz z[] = {
@@ -536,6 +537,9 @@ vx_path(int argc, char **argv, void *data)
         {"rttlimit",  "Disable path if RTT exceeds this", argz_ull, &rttlimit},
         {"mtu",  "Fixed MTU to use (wire size, default 1400)",
                                                         argz_ull, &mtu},
+        {"bind", "Bind each sub-flow's socket to the interface so no route, rule or "
+                 "mark can move it: on|off (default on; requires via)",
+                                                vx_argz_onoff, &bind_dev},
         {"monitor", "Dedicated health-probe sub-flow: never carries data, "
                      "drives this path's group's losslimit decision via a "
                      "fixed-interval sequence-numbered probe instead of "
@@ -568,7 +572,7 @@ vx_path(int argc, char **argv, void *data)
                  argz_is_set(z, "pref") || argz_is_set(z, "connections") ||
                  argz_is_set(z, "losslimit") ||
                  argz_is_set(z, "rttlimit") || argz_is_set(z, "mtu") ||
-                 argz_is_set(z, "monitor") ||
+                 argz_is_set(z, "monitor") || bind_dev ||
                  argz_is_set(z, "probeinterval") ||
                  argz_is_set(z, "probewindow") ||
                  argz_is_set(z, "proberecover");
@@ -581,6 +585,11 @@ vx_path(int argc, char **argv, void *data)
     if (argz_is_set(z, "connections") && connections.value > 1 &&
         !ifname[0]) {
         vx_log("connections > 1 requires a path selected by 'via'\n");
+        ctl_delete(fd);
+        return -1;
+    }
+    if (bind_dev && !ifname[0]) {
+        vx_log("bind requires a path selected by 'via'\n");
         ctl_delete(fd);
         return -1;
     }
@@ -602,6 +611,7 @@ vx_path(int argc, char **argv, void *data)
             .type = CTL_PATH_CONF,
             .connections = argz_is_set(z, "connections")
                           ? connections.value : 0,
+            .bind_dev = bind_dev,
             .path.conf = {
                 .local       = local.sock,
                 .remote      = remote.sock,
