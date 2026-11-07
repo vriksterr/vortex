@@ -610,6 +610,8 @@ struct vmux {
      * sends us. */
     uint64_t seq_tx_start;
     uint32_t seq_tx_next;
+    /* Last nonce handed out by vmux_nonce(), shared by every thread. */
+    uint64_t nonce_last;
     uint64_t seq_rx_start;
     /* Whether the stream we stamp (seq_tx_tcp) / the peer stamps toward us
      * (seq_rx_tcp) includes TCP packets, see VMUX_SEQ_FLAG_*_TCP. */
@@ -2314,6 +2316,42 @@ vmux_is_tcp(const unsigned char *ip, size_t size)
     return 0;
 }
 
+/* The packet's first VMUX_TIME_SIZE bytes are both its timestamp and the
+ * cipher's nonce, and a nonce must never be used twice with the same key.
+ * The clock alone is not enough: it ticks every 2 microseconds, and packets
+ * are encrypted faster than that (a batch on one thread, several worker
+ * threads at once, one control message per path in the same update pass), so
+ * about one packet in ten used to repeat an earlier packet's nonce.
+ *
+ * This hands out strictly increasing values: the clock if it is ahead of the
+ * last value handed out, otherwise the last value plus one tick. One shared
+ * atomic, no lock: every thread retries a compare-and-swap that costs a few
+ * nanoseconds next to the encryption itself, so no thread ever waits on
+ * another. The wire format is unchanged and the receiver needs nothing new (it
+ * only reads the field back); at a rate above one packet per tick the value
+ * runs slightly ahead of the clock, which `timetolerance` absorbs.
+ *
+ * Even values only (bit 0 stays clear, as VMUX_TIME_MASK leaves it); control
+ * messages set bit 0 afterwards (VMUX_MSG_MARK), so a control message and a
+ * data packet can never match either. Comparison is modulo the 48-bit field. */
+static inline uint64_t
+vmux_nonce(struct vmux *vmux, uint64_t now)
+{
+    uint64_t last = __atomic_load_n(&vmux->nonce_last, __ATOMIC_RELAXED);
+    uint64_t n;
+
+    do {
+        n = VMUX_TIME_MASK(now);
+
+        const uint64_t ahead = VMUX_TIME_MASK(n - last);
+
+        if (last && (!ahead || ahead >= VMUX_TIME_HALF))
+            n = VMUX_TIME_MASK(last + 2);
+    } while (!__atomic_compare_exchange_n(&vmux->nonce_last, &last, n, 1,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return n;
+}
+
 static size_t
 vmux_encrypt(struct vmux *vmux, uint64_t now,
             unsigned char *dst, size_t dst_size,
@@ -2348,7 +2386,7 @@ vmux_encrypt(struct vmux *vmux, uint64_t now,
         .src = src,
         .size = src_size,
     };
-    vmux_store(dst, now, VMUX_TIME_SIZE);
+    vmux_store(dst, vmux_nonce(vmux, now), VMUX_TIME_SIZE);
 
     /* vmux->keyx.{current,next} can be replaced at any moment by another
      * thread's vmux_recv_msg() (a real key rotation) -- worker threads no
@@ -2568,7 +2606,7 @@ vmux_send_msg(struct vmux *vmux, struct vmux_path *path, uint64_t now,
         ext[5] = (grp && grp->probe_degraded) ? 1 : 0;
     }
 
-    vmux_store(dst, VMUX_MSG_MARK(now), VMUX_TIME_SIZE);
+    vmux_store(dst, VMUX_MSG_MARK(vmux_nonce(vmux, now)), VMUX_TIME_SIZE);
     VMUX_STORE_MSG(msg->sent_time, sent_time);
 
     if (vmux_addr_from_sock(&msg->addr, &path->conf.remote))
